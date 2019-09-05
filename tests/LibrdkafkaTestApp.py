@@ -35,12 +35,18 @@ class LibrdkafkaTestApp(App):
         f, self.test_conf_file = self.open_file('test.conf', 'perm')
         f.write('broker.address.family=v4\n'.encode('ascii'))
         f.write(('test.sql.command=sqlite3 rdktests\n').encode('ascii'))
-        f.write(('\n'.join(conf_blob)).encode('ascii'))
+        f.write('test.timeout.multiplier=2\n'.encode('ascii'))
 
-        if version == 'trunk' or version.startswith('0.10.'):
-            conf_blob.append('api.version.request=true')
-        else:
+        sparse = conf.get('sparse_connections', None)
+        if sparse is not None:
+            f.write('enable.sparse.connections={}\n'.format(sparse).encode('ascii'))
+
+        if version.startswith('0.9') or version.startswith('0.8'):
+            conf_blob.append('api.version.request=false')
             conf_blob.append('broker.version.fallback=%s' % version)
+        else:
+            conf_blob.append('broker.version.fallback=0.10.0.0') # any broker version with ApiVersion support
+            conf_blob.append('api.version.fallback.ms=0')
 
         # SASL (only one mechanism supported at a time)
         mech = self.conf.get('sasl_mechanisms', '').split(',')[0]
@@ -54,6 +60,11 @@ class LibrdkafkaTestApp(App):
                     conf_blob.append('sasl.username=%s' % u)
                     conf_blob.append('sasl.password=%s' % p)
                     break
+
+            elif mech == 'OAUTHBEARER':
+                security_protocol='SASL_PLAINTEXT'
+                conf_blob.append('enable.sasl.oauthbearer.unsecure.jwt=true\n')
+                conf_blob.append('sasl.oauthbearer.config=%s\n' % self.conf.get('sasl_oauthbearer_config'))
 
             elif mech == 'GSSAPI':
                 security_protocol='SASL_PLAINTEXT'
@@ -77,12 +88,27 @@ class LibrdkafkaTestApp(App):
         if getattr(cluster, 'ssl', None) is not None:
             ssl = cluster.ssl
 
-            key, req, pem = ssl.create_key('librdkafka%s' % self.appid)
+            key = ssl.create_cert('librdkafka%s' % self.appid)
 
-            conf_blob.append('ssl.ca.location=%s' % ssl.ca_cert)
-            conf_blob.append('ssl.certificate.location=%s' % pem)
-            conf_blob.append('ssl.key.location=%s' % key)
-            conf_blob.append('ssl.key.password=%s' % ssl.conf.get('ssl_key_pass'))
+            conf_blob.append('ssl.ca.location=%s' % ssl.ca['pem'])
+            conf_blob.append('ssl.certificate.location=%s' % key['pub']['pem'])
+            conf_blob.append('ssl.key.location=%s' % key['priv']['pem'])
+            conf_blob.append('ssl.key.password=%s' % key['password'])
+
+            # Some tests need fine-grained access to various cert files,
+            # set up the env vars accordingly.
+            for k, v in ssl.ca.iteritems():
+                self.env_add('RDK_SSL_ca_{}'.format(k), v)
+
+            # Set envs for all generated keys so tests can find them.
+            for k, v in key.iteritems():
+                if type(v) is dict:
+                    for k2, v2 in v.iteritems():
+                        # E.g. "RDK_SSL_priv_der=path/to/librdkafka-priv.der"
+                        self.env_add('RDK_SSL_{}_{}'.format(k, k2), v2)
+                else:
+                    self.env_add('RDK_SSL_{}'.format(k), v)
+
 
             if 'SASL' in security_protocol:
                 security_protocol = 'SASL_SSL'
@@ -124,7 +150,10 @@ class LibrdkafkaTestApp(App):
         extra_args = list()
         if not self.local_tests:
             extra_args.append('-L')
-        return './run-test.sh -p5 -K %s ./merged %s' % (' '.join(extra_args), self.test_mode)
+        if self.conf.get('args', None) is not None:
+            extra_args.append(self.conf.get('args'))
+        extra_args.append('-E')
+        return './run-test.sh -p%d -K %s ./merged %s' % (int(self.conf.get('parallel', 5)), ' '.join(extra_args), self.test_mode)
 
 
     def report (self):

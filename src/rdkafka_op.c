@@ -72,6 +72,15 @@ const char *rd_kafka_op2str (rd_kafka_op_type_t type) {
                 [RD_KAFKA_OP_METADATA] = "REPLY:METADATA",
                 [RD_KAFKA_OP_LOG] = "REPLY:LOG",
                 [RD_KAFKA_OP_WAKEUP] = "REPLY:WAKEUP",
+                [RD_KAFKA_OP_CREATETOPICS] = "REPLY:CREATETOPICS",
+                [RD_KAFKA_OP_DELETETOPICS] = "REPLY:DELETETOPICS",
+                [RD_KAFKA_OP_CREATEPARTITIONS] = "REPLY:CREATEPARTITIONS",
+                [RD_KAFKA_OP_ALTERCONFIGS] = "REPLY:ALTERCONFIGS",
+                [RD_KAFKA_OP_DESCRIBECONFIGS] = "REPLY:DESCRIBECONFIGS",
+                [RD_KAFKA_OP_ADMIN_RESULT] = "REPLY:ADMIN_RESULT",
+                [RD_KAFKA_OP_PURGE] = "REPLY:PURGE",
+                [RD_KAFKA_OP_CONNECT] = "REPLY:CONNECT",
+                [RD_KAFKA_OP_OAUTHBEARER_REFRESH] = "REPLY:OAUTHBEARER_REFRESH"
         };
 
         if (type & RD_KAFKA_OP_REPLY)
@@ -185,6 +194,15 @@ rd_kafka_op_t *rd_kafka_op_new0 (const char *source, rd_kafka_op_type_t type) {
                 [RD_KAFKA_OP_METADATA] = sizeof(rko->rko_u.metadata),
                 [RD_KAFKA_OP_LOG] = sizeof(rko->rko_u.log),
                 [RD_KAFKA_OP_WAKEUP] = 0,
+                [RD_KAFKA_OP_CREATETOPICS] = sizeof(rko->rko_u.admin_request),
+                [RD_KAFKA_OP_DELETETOPICS] = sizeof(rko->rko_u.admin_request),
+                [RD_KAFKA_OP_CREATEPARTITIONS] = sizeof(rko->rko_u.admin_request),
+                [RD_KAFKA_OP_ALTERCONFIGS] = sizeof(rko->rko_u.admin_request),
+                [RD_KAFKA_OP_DESCRIBECONFIGS] = sizeof(rko->rko_u.admin_request),
+                [RD_KAFKA_OP_ADMIN_RESULT] = sizeof(rko->rko_u.admin_result),
+                [RD_KAFKA_OP_PURGE] = sizeof(rko->rko_u.purge),
+                [RD_KAFKA_OP_CONNECT] = 0,
+                [RD_KAFKA_OP_OAUTHBEARER_REFRESH] = 0,
 	};
 	size_t tsize = op2size[type & ~RD_KAFKA_OP_FLAGMASK];
 
@@ -291,6 +309,20 @@ void rd_kafka_op_destroy (rd_kafka_op_t *rko) {
                 rd_free(rko->rko_u.log.str);
                 break;
 
+        case RD_KAFKA_OP_CREATETOPICS:
+        case RD_KAFKA_OP_DELETETOPICS:
+        case RD_KAFKA_OP_CREATEPARTITIONS:
+        case RD_KAFKA_OP_ALTERCONFIGS:
+        case RD_KAFKA_OP_DESCRIBECONFIGS:
+                rd_kafka_replyq_destroy(&rko->rko_u.admin_request.replyq);
+                rd_list_destroy(&rko->rko_u.admin_request.args);
+                break;
+
+        case RD_KAFKA_OP_ADMIN_RESULT:
+                rd_list_destroy(&rko->rko_u.admin_result.results);
+                RD_IF_FREE(rko->rko_u.admin_result.errstr, rd_free);
+                break;
+
 	default:
 		break;
 	}
@@ -300,7 +332,8 @@ void rd_kafka_op_destroy (rd_kafka_op_t *rko) {
                 /* Let callback clean up */
                 rko->rko_err = RD_KAFKA_RESP_ERR__DESTROY;
                 res = rko->rko_op_cb(rko->rko_rk, NULL, rko);
-                assert(res != RD_KAFKA_OP_RES_YIELD);
+                rd_assert(res != RD_KAFKA_OP_RES_YIELD);
+                rd_assert(res != RD_KAFKA_OP_RES_KEEP);
         }
 
 	RD_IF_FREE(rko->rko_rktp, rd_kafka_toppar_destroy);
@@ -433,7 +466,7 @@ rd_kafka_op_t *rd_kafka_op_req0 (rd_kafka_q_t *destq,
                 return NULL;
 
         /* Wait for reply */
-        reply = rd_kafka_q_pop(recvq, timeout_ms, 0);
+        reply = rd_kafka_q_pop(recvq, rd_timeout_us(timeout_ms), 0);
 
         /* May be NULL for timeout */
         return reply;
@@ -492,7 +525,8 @@ rd_kafka_op_res_t rd_kafka_op_call (rd_kafka_t *rk, rd_kafka_q_t *rkq,
         res = rko->rko_op_cb(rk, rkq, rko);
         if (unlikely(res == RD_KAFKA_OP_RES_YIELD || rd_kafka_yield_thread))
                 return RD_KAFKA_OP_RES_YIELD;
-        rko->rko_op_cb = NULL;
+        if (res != RD_KAFKA_OP_RES_KEEP)
+                rko->rko_op_cb = NULL;
         return res;
 }
 
@@ -539,6 +573,10 @@ rd_kafka_op_new_fetch_msg (rd_kafka_msg_t **rkmp,
         rko->rko_len       = (int32_t)rkm->rkm_len;
 
         rkm->rkm_partition = rktp->rktp_partition;
+
+        /* Persistence status is always PERSISTED for consumed messages
+         * since we managed to read the message. */
+        rkm->rkm_status = RD_KAFKA_MSG_STATUS_PERSISTED;
 
         return rko;
 }
@@ -617,7 +655,10 @@ rd_kafka_op_handle (rd_kafka_t *rk, rd_kafka_q_t *rkq, rd_kafka_op_t *rko,
         rd_kafka_op_res_t res;
 
         res = rd_kafka_op_handle_std(rk, rkq, rko, cb_type);
-        if (res == RD_KAFKA_OP_RES_HANDLED) {
+        if (res == RD_KAFKA_OP_RES_KEEP) {
+                /* Op was handled but must not be destroyed. */
+                return res;
+        } if (res == RD_KAFKA_OP_RES_HANDLED) {
                 rd_kafka_op_destroy(rko);
                 return res;
         } else if (unlikely(res == RD_KAFKA_OP_RES_YIELD))

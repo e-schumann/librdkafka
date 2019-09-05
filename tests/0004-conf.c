@@ -162,6 +162,15 @@ static void do_test_kafka_new_failures (void) {
         rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
         TEST_ASSERT(rk, "kafka_new() failed: %s", errstr);
         rd_kafka_destroy(rk);
+
+        /* set conflicting properties */
+        conf = rd_kafka_conf_new();
+        test_conf_set(conf, "acks", "1");
+        test_conf_set(conf, "enable.idempotence", "true");
+        rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf, errstr, sizeof(errstr));
+        TEST_ASSERT(!rk, "kafka_new() should have failed");
+        rd_kafka_conf_destroy(conf);
+        TEST_SAY(_C_GRN "Ok: %s\n", errstr);
 }
 
 
@@ -214,6 +223,140 @@ static void do_test_special_invalid_conf (void) {
         TEST_SAY(_C_GRN "Ok: %s\n" _C_CLR, errstr);
 
         rd_kafka_conf_destroy(conf);
+}
+
+
+/**
+ * @brief Verify idempotence configuration constraints
+ */
+static void do_test_idempotence_conf (void) {
+        static const struct {
+                const char *prop;
+                const char *val;
+                rd_bool_t topic_conf;
+                rd_bool_t exp_rk_fail;
+                rd_bool_t exp_rkt_fail;
+        } check[] = {
+                { "acks", "1", rd_true, rd_false, rd_true },
+                { "acks", "all", rd_true, rd_false, rd_false },
+                { "queuing.strategy", "lifo", rd_true, rd_false, rd_true },
+                { NULL }
+        };
+        int i;
+
+        for (i = 0 ; check[i].prop ; i++) {
+                int j;
+
+                for (j = 0 ; j < 1 + (check[i].topic_conf ? 1 : 0) ; j++) {
+                        /* j = 0: set on global config
+                        *  j = 1: set on topic config */
+                        rd_kafka_conf_t *conf;
+                        rd_kafka_topic_conf_t *tconf = NULL;
+                        rd_kafka_t *rk;
+                        rd_kafka_topic_t *rkt;
+                        char errstr[512];
+
+                        conf = rd_kafka_conf_new();
+                        test_conf_set(conf, "enable.idempotence", "true");
+
+                        if (j == 0)
+                                test_conf_set(conf, check[i].prop, check[i].val);
+
+
+                        rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf,
+                                          errstr, sizeof(errstr));
+
+                        if (!rk) {
+                                /* default topic config (j=0) will fail. */
+                                TEST_ASSERT(check[i].exp_rk_fail ||
+                                            (j == 0 && check[i].exp_rkt_fail &&
+                                             check[i].topic_conf),
+                                            "Did not expect config #%d.%d "
+                                            "to fail: %s",
+                                            i, j, errstr);
+
+                                rd_kafka_conf_destroy(conf);
+                                continue;
+
+                        } else {
+                                TEST_ASSERT(!check[i].exp_rk_fail,
+                                            "Expect config #%d.%d to fail");
+                        }
+
+                        if (j == 1) {
+                                tconf = rd_kafka_topic_conf_new();
+                                test_topic_conf_set(tconf, check[i].prop,
+                                                    check[i].val);
+                        }
+
+                        rkt = rd_kafka_topic_new(rk, "mytopic", tconf);
+                        if (!rkt) {
+                                TEST_ASSERT(check[i].exp_rkt_fail,
+                                            "Did not expect topic config "
+                                            "#%d.%d to fail: %s",
+                                            i, j,
+                                            rd_kafka_err2str(
+                                                    rd_kafka_last_error()));
+
+
+                        } else {
+                                TEST_ASSERT(!check[i].exp_rkt_fail,
+                                            "Expect topic config "
+                                            "#%d.%d to fail");
+                                rd_kafka_topic_destroy(rkt);
+                        }
+
+                        rd_kafka_destroy(rk);
+                }
+        }
+}
+
+
+/**
+ * @brief Verify that configuration properties can be extract
+ *        from the instance config object.
+ */
+static void do_test_instance_conf (void) {
+        rd_kafka_conf_t *conf;
+        const rd_kafka_conf_t *iconf;
+        rd_kafka_t *rk;
+        rd_kafka_conf_res_t res;
+        static const char *props[] = {
+                "linger.ms", "123",
+                "group.id", "test1",
+                "enable.auto.commit", "false",
+                NULL,
+        };
+        const char **p;
+
+        conf = rd_kafka_conf_new();
+
+        for (p = props ; *p ; p += 2) {
+                res = rd_kafka_conf_set(conf, *p, *(p+1), NULL, 0);
+                TEST_ASSERT(res == RD_KAFKA_CONF_OK, "failed to set %s", *p);
+        }
+
+        rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, NULL, 0);
+        TEST_ASSERT(rk, "failed to create consumer");
+
+        iconf = rd_kafka_conf(rk);
+        TEST_ASSERT(conf, "failed to get instance config");
+
+        for (p = props ; *p ; p += 2) {
+                char dest[512];
+                size_t destsz = sizeof(dest);
+
+                res = rd_kafka_conf_get(iconf, *p, dest, &destsz);
+                TEST_ASSERT(res == RD_KAFKA_CONF_OK,
+                            "failed to get %s: result %d", *p, res);
+
+                TEST_SAY("Instance config %s=%s\n", *p, dest);
+                TEST_ASSERT(!strcmp(*(p+1), dest),
+                            "Expected %s=%s, not %s",
+                            *p, *(p+1), dest);
+        }
+
+        rd_kafka_destroy(rk);
 }
 
 
@@ -381,7 +524,31 @@ int main_0004_conf (int argc, char **argv) {
 		rd_kafka_conf_destroy(conf);
 	}
 
-	/* Canonical int values, aliases, s2i-verified strings */
+        {
+                rd_kafka_conf_res_t res;
+
+                TEST_SAY("Error reporting for S2F properties\n");
+                conf = rd_kafka_conf_new();
+
+                res = rd_kafka_conf_set(conf, "debug",
+                        "cgrp,invalid-value,topic", errstr, sizeof(errstr));
+
+                TEST_ASSERT(res == RD_KAFKA_CONF_INVALID,
+                        "expected 'debug=invalid-value' to fail with INVALID, "
+                        "not %d", res);
+                TEST_ASSERT(strstr(errstr, "invalid-value"),
+                        "expected invalid value to be mentioned in error, "
+                        "not \"%s\"", errstr);
+                TEST_ASSERT(
+                        !strstr(errstr, "cgrp") && !strstr(errstr, "topic"),
+                        "expected only invalid value to be mentioned, "
+                        "not \"%s\"", errstr);
+                TEST_SAY(_C_GRN "Ok: %s\n" _C_CLR, errstr);
+
+                rd_kafka_conf_destroy(conf);
+        }
+
+	/* Canonical int values, aliases, s2i-verified strings, doubles */
 	{
 		static const struct {
 			const char *prop;
@@ -404,6 +571,9 @@ int main_0004_conf (int argc, char **argv) {
 			{ "sasl.mechanisms", "GSSAPI,PLAIN", NULL, 1  },
 			{ "sasl.mechanisms", "", NULL, 1  },
 #endif
+                        { "linger.ms", "12555.3", "12555.3", 1 },
+                        { "linger.ms", "1500.000", "1500", 1 },
+                        { "linger.ms", "0.0001", "0.0001", 1 },
 			{ NULL }
 		};
 
@@ -469,6 +639,10 @@ int main_0004_conf (int argc, char **argv) {
         do_test_kafka_new_failures();
 
         do_test_special_invalid_conf();
+
+        do_test_idempotence_conf();
+
+        do_test_instance_conf();
 
 	return 0;
 }

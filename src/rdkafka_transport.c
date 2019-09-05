@@ -42,33 +42,24 @@
 
 #include <errno.h>
 
-#if WITH_VALGRIND
-/* OpenSSL relies on uninitialized memory, which Valgrind will whine about.
- * We use in-code Valgrind macros to suppress those warnings. */
-#include <valgrind/memcheck.h>
-#else
-#define VALGRIND_MAKE_MEM_DEFINED(A,B)
-#endif
-
-
-#ifdef _MSC_VER
-#define socket_errno WSAGetLastError()
-#else
-#include <sys/socket.h>
-#define socket_errno errno
-#define SOCKET_ERROR -1
-#endif
-
 /* AIX doesn't have MSG_DONTWAIT */
 #ifndef MSG_DONTWAIT
 #  define MSG_DONTWAIT MSG_NONBLOCK
 #endif
 
-
 #if WITH_SSL
-static mtx_t *rd_kafka_ssl_locks;
-static int    rd_kafka_ssl_locks_cnt;
+#include "rdkafka_ssl.h"
 #endif
+
+/**< Current thread's rd_kafka_transport_t instance.
+ *   This pointer is set up when calling any OpenSSL APIs that might
+ *   trigger SSL callbacks, and is used to retrieve the SSL object's
+ *   corresponding rd_kafka_transport_t instance.
+ *   There is an set/get_ex_data() API in OpenSSL, but it requires storing
+ *   a unique index somewhere, which we can't do without having a singleton
+ *   object, so instead we cut out the middle man and store the
+ *   rd_kafka_transport_t pointer directly in the thread-local memory. */
+RD_TLS rd_kafka_transport_t *rd_kafka_curr_transport;
 
 
 
@@ -93,10 +84,9 @@ static void rd_kafka_transport_close0 (rd_kafka_t *rk, int s) {
  */
 void rd_kafka_transport_close (rd_kafka_transport_t *rktrans) {
 #if WITH_SSL
-	if (rktrans->rktrans_ssl) {
-		SSL_shutdown(rktrans->rktrans_ssl);
-		SSL_free(rktrans->rktrans_ssl);
-	}
+        rd_kafka_curr_transport = rktrans;
+        if (rktrans->rktrans_ssl)
+                rd_kafka_transport_ssl_close(rktrans);
 #endif
 
         rd_kafka_sasl_close(rktrans);
@@ -130,9 +120,10 @@ static const char *socket_strerror(int err) {
  * @brief sendmsg() abstraction, converting a list of segments to iovecs.
  * @remark should only be called if the number of segments is > 1.
  */
-ssize_t rd_kafka_transport_socket_sendmsg (rd_kafka_transport_t *rktrans,
-                                           rd_slice_t *slice,
-                                           char *errstr, size_t errstr_size) {
+static ssize_t
+rd_kafka_transport_socket_sendmsg (rd_kafka_transport_t *rktrans,
+                                   rd_slice_t *slice,
+                                   char *errstr, size_t errstr_size) {
         struct iovec iov[IOV_MAX];
         struct msghdr msg = { .msg_iov = iov };
         size_t iovlen;
@@ -143,7 +134,7 @@ ssize_t rd_kafka_transport_socket_sendmsg (rd_kafka_transport_t *rktrans,
                          rktrans->rktrans_sndbuf_size);
         msg.msg_iovlen = (int)iovlen;
 
-#ifdef sun
+#ifdef __sun
         /* See recvmsg() comment. Setting it here to be safe. */
         socket_errno = EAGAIN;
 #endif
@@ -261,7 +252,7 @@ rd_kafka_transport_socket_recvmsg (rd_kafka_transport_t *rktrans,
                              rktrans->rktrans_rcvbuf_size);
         msg.msg_iovlen = (int)iovlen;
 
-#ifdef sun
+#ifdef __sun
         /* SunOS doesn't seem to set errno when recvmsg() fails
          * due to no data and MSG_DONTWAIT is set. */
         socket_errno = EAGAIN;
@@ -270,14 +261,18 @@ rd_kafka_transport_socket_recvmsg (rd_kafka_transport_t *rktrans,
         if (unlikely(r <= 0)) {
                 if (r == -1 && socket_errno == EAGAIN)
                         return 0;
-                else if (r == 0) {
+                else if (r == 0 ||
+                         (r == -1 && socket_errno == ECONNRESET)) {
                         /* Receive 0 after POLLIN event means
                          * connection closed. */
                         rd_snprintf(errstr, errstr_size, "Disconnected");
+                        errno = ECONNRESET;
                         return -1;
                 } else if (r == -1) {
+                        int errno_save = errno;
                         rd_snprintf(errstr, errstr_size, "%s",
                                     rd_strerror(errno));
+                        errno = errno_save;
                         return -1;
                 }
         }
@@ -311,31 +306,32 @@ rd_kafka_transport_socket_recv0 (rd_kafka_transport_t *rktrans,
                          len,
                          0);
 
-#ifdef _MSC_VER
                 if (unlikely(r == SOCKET_ERROR)) {
-                        if (WSAGetLastError() == WSAEWOULDBLOCK)
+                        int errno_save = socket_errno;
+                        if (errno_save == EAGAIN
+#ifdef _MSC_VER
+                           || errno_save == WSAEWOULDBLOCK
+#endif 
+                           )
                                 return sum;
-                        rd_snprintf(errstr, errstr_size, "%s",
-                                    socket_strerror(WSAGetLastError()));
-                        return -1;
-                }
-#else
-                if (unlikely(r <= 0)) {
-                        if (r == -1 && socket_errno == EAGAIN)
-                                return 0;
-                        else if (r == 0) {
-                                /* Receive 0 after POLLIN event means
-                                 * connection closed. */
-                                rd_snprintf(errstr, errstr_size,
-                                            "Disconnected");
-                                return -1;
-                        } else if (r == -1) {
+                        else {
                                 rd_snprintf(errstr, errstr_size, "%s",
-                                            rd_strerror(errno));
+                                    socket_strerror(errno_save));
+#ifndef _MSC_VER
+                                errno = errno_save;
+#endif
                                 return -1;
                         }
-                }
+                } else if (unlikely(r == 0)) {
+                        /* Receive 0 after POLLIN event means
+                         * connection closed. */
+                        rd_snprintf(errstr, errstr_size,
+                                    "Disconnected");
+#ifndef _MSC_VER
+                        errno = ECONNRESET;
 #endif
+                        return -1;
+                }
 
                 /* Update buffer write position */
                 rd_buf_write(rbuf, NULL, (size_t)r);
@@ -379,656 +375,50 @@ void rd_kafka_transport_connect_done (rd_kafka_transport_t *rktrans,
 				      char *errstr) {
 	rd_kafka_broker_t *rkb = rktrans->rktrans_rkb;
 
-	rd_kafka_broker_connect_done(rkb, errstr);
+        rd_kafka_curr_transport = rktrans;
+
+        rd_kafka_broker_connect_done(rkb, errstr);
 }
 
 
 
-#if WITH_SSL
 
-
-/**
- * Serves the entire OpenSSL error queue and logs each error.
- * The last error is not logged but returned in 'errstr'.
- *
- * If 'rkb' is non-NULL broker-specific logging will be used,
- * else it will fall back on global 'rk' debugging.
- */
-static char *rd_kafka_ssl_error (rd_kafka_t *rk, rd_kafka_broker_t *rkb,
-				 char *errstr, size_t errstr_size) {
-    unsigned long l;
-    const char *file, *data;
-    int line, flags;
-    int cnt = 0;
-
-    while ((l = ERR_get_error_line_data(&file, &line, &data, &flags)) != 0) {
-	char buf[256];
-
-	if (cnt++ > 0) {
-		/* Log last message */
-		if (rkb)
-			rd_rkb_log(rkb, LOG_ERR, "SSL", "%s", errstr);
-		else
-			rd_kafka_log(rk, LOG_ERR, "SSL", "%s", errstr);
-	}
-	
-	ERR_error_string_n(l, buf, sizeof(buf));
-
-	rd_snprintf(errstr, errstr_size, "%s:%d: %s: %s",
-		    file, line, buf, (flags & ERR_TXT_STRING) ? data : "");
-
-    }
-
-    if (cnt == 0)
-    	    rd_snprintf(errstr, errstr_size, "No error");
-    
-    return errstr;
-}
-
-
-static void rd_kafka_transport_ssl_lock_cb (int mode, int i,
-					    const char *file, int line) {
-	if (mode & CRYPTO_LOCK)
-		mtx_lock(&rd_kafka_ssl_locks[i]);
-	else
-		mtx_unlock(&rd_kafka_ssl_locks[i]);
-}
-
-static unsigned long rd_kafka_transport_ssl_threadid_cb (void) {
-#ifdef _MSC_VER
-        /* Windows makes a distinction between thread handle
-         * and thread id, which means we can't use the
-         * thrd_current() API that returns the handle. */
-        return (unsigned long)GetCurrentThreadId();
-#else
-        return (unsigned long)(intptr_t)thrd_current();
-#endif
-}
-
-
-/**
- * Global OpenSSL cleanup.
- */
-void rd_kafka_transport_ssl_term (void) {
-	int i;
-
-	CRYPTO_set_id_callback(NULL);
-	CRYPTO_set_locking_callback(NULL);
-        CRYPTO_cleanup_all_ex_data();
-
-	for (i = 0 ; i < rd_kafka_ssl_locks_cnt ; i++)
-		mtx_destroy(&rd_kafka_ssl_locks[i]);
-
-	rd_free(rd_kafka_ssl_locks);
-
-}
-
-
-/**
- * Global OpenSSL init.
- */
-void rd_kafka_transport_ssl_init (void) {
-	int i;
-	
-	rd_kafka_ssl_locks_cnt = CRYPTO_num_locks();
-	rd_kafka_ssl_locks = rd_malloc(rd_kafka_ssl_locks_cnt *
-				       sizeof(*rd_kafka_ssl_locks));
-	for (i = 0 ; i < rd_kafka_ssl_locks_cnt ; i++)
-		mtx_init(&rd_kafka_ssl_locks[i], mtx_plain);
-
-	CRYPTO_set_id_callback(rd_kafka_transport_ssl_threadid_cb);
-	CRYPTO_set_locking_callback(rd_kafka_transport_ssl_lock_cb);
-	
-	SSL_load_error_strings();
-	SSL_library_init();
-	OpenSSL_add_all_algorithms();
-}
-
-
-/**
- * Set transport IO event polling based on SSL error.
- *
- * Returns -1 on permanent errors.
- *
- * Locality: broker thread
- */
-static RD_INLINE int
-rd_kafka_transport_ssl_io_update (rd_kafka_transport_t *rktrans, int ret,
-				  char *errstr, size_t errstr_size) {
-	int serr = SSL_get_error(rktrans->rktrans_ssl, ret);
-	int serr2;
-
-	switch (serr)
-	{
-	case SSL_ERROR_WANT_READ:
-		rd_kafka_transport_poll_set(rktrans, POLLIN);
-		break;
-
-	case SSL_ERROR_WANT_WRITE:
-	case SSL_ERROR_WANT_CONNECT:
-		rd_kafka_transport_poll_set(rktrans, POLLOUT);
-		break;
-
-	case SSL_ERROR_SYSCALL:
-		if (!(serr2 = SSL_get_error(rktrans->rktrans_ssl, ret))) {
-			if (ret == 0)
-				errno = ECONNRESET;
-			rd_snprintf(errstr, errstr_size,
-				    "SSL syscall error: %s", rd_strerror(errno));
-		} else
-			rd_snprintf(errstr, errstr_size,
-				    "SSL syscall error number: %d: %s", serr2,
-				    rd_strerror(errno));
-		return -1;
-
-        case SSL_ERROR_ZERO_RETURN:
-                rd_snprintf(errstr, errstr_size, "Disconnected");
-                return -1;
-
-	default:
-		rd_kafka_ssl_error(NULL, rktrans->rktrans_rkb,
-				   errstr, errstr_size);
-		return -1;
-	}
-
-	return 0;
-}
-
-static ssize_t
-rd_kafka_transport_ssl_send (rd_kafka_transport_t *rktrans,
-                             rd_slice_t *slice,
-                             char *errstr, size_t errstr_size) {
-	ssize_t sum = 0;
-        const void *p;
-        size_t rlen;
-
-        while ((rlen = rd_slice_peeker(slice, &p))) {
-                int r;
-
-                r = SSL_write(rktrans->rktrans_ssl, p, (int)rlen);
-
-		if (unlikely(r <= 0)) {
-			if (rd_kafka_transport_ssl_io_update(rktrans, r,
-							     errstr,
-							     errstr_size) == -1)
-				return -1;
-			else
-				return sum;
-		}
-
-                /* Update buffer read position */
-                rd_slice_read(slice, NULL, (size_t)r);
-
-		sum += r;
-                 /* FIXME: remove this and try again immediately and let
-                  *        the next SSL_write() call fail instead? */
-                if ((size_t)r < rlen)
-                        break;
-
-	}
-	return sum;
-}
-
-static ssize_t
-rd_kafka_transport_ssl_recv (rd_kafka_transport_t *rktrans,
-                             rd_buf_t *rbuf, char *errstr, size_t errstr_size) {
-	ssize_t sum = 0;
-        void *p;
-        size_t len;
-
-        while ((len = rd_buf_get_writable(rbuf, &p))) {
-		int r;
-
-                r = SSL_read(rktrans->rktrans_ssl, p, (int)len);
-
-		if (unlikely(r <= 0)) {
-			if (rd_kafka_transport_ssl_io_update(rktrans, r,
-							     errstr,
-							     errstr_size) == -1)
-				return -1;
-			else
-				return sum;
-		}
-
-                VALGRIND_MAKE_MEM_DEFINED(p, r);
-
-                /* Update buffer write position */
-                rd_buf_write(rbuf, NULL, (size_t)r);
-
-		sum += r;
-
-                 /* FIXME: remove this and try again immediately and let
-                  *        the next SSL_read() call fail instead? */
-                if ((size_t)r < len)
-                        break;
-
-	}
-	return sum;
-
-}
-
-
-/**
- * OpenSSL password query callback
- *
- * Locality: application thread
- */
-static int rd_kafka_transport_ssl_passwd_cb (char *buf, int size, int rwflag,
-					     void *userdata) {
-	rd_kafka_t *rk = userdata;
-	int pwlen;
-
-	rd_kafka_dbg(rk, SECURITY, "SSLPASSWD",
-		     "Private key file \"%s\" requires password",
-		     rk->rk_conf.ssl.key_location);
-
-	if (!rk->rk_conf.ssl.key_password) {
-		rd_kafka_log(rk, LOG_WARNING, "SSLPASSWD",
-			     "Private key file \"%s\" requires password but "
-			     "no password configured (ssl.key.password)",
-			     rk->rk_conf.ssl.key_location);
-		return -1;
-	}
-
-
-	pwlen = (int) strlen(rk->rk_conf.ssl.key_password);
-	memcpy(buf, rk->rk_conf.ssl.key_password, RD_MIN(pwlen, size));
-
-	return pwlen;
-}
-
-/**
- * Set up SSL for a newly connected connection
- *
- * Returns -1 on failure, else 0.
- */
-static int rd_kafka_transport_ssl_connect (rd_kafka_broker_t *rkb,
-					   rd_kafka_transport_t *rktrans,
-					   char *errstr, size_t errstr_size) {
-	int r;
-	char name[RD_KAFKA_NODENAME_SIZE];
-	char *t;
-
-	rktrans->rktrans_ssl = SSL_new(rkb->rkb_rk->rk_conf.ssl.ctx);
-	if (!rktrans->rktrans_ssl)
-		goto fail;
-
-	if (!SSL_set_fd(rktrans->rktrans_ssl, rktrans->rktrans_s))
-		goto fail;
-
-#if (OPENSSL_VERSION_NUMBER >= 0x0090806fL) && !defined(OPENSSL_NO_TLSEXT)
-	/* If non-numerical hostname, send it for SNI */
-	rd_snprintf(name, sizeof(name), "%s", rkb->rkb_nodename);
-	if ((t = strrchr(name, ':')))
-		*t = '\0';
-	if (!(/*ipv6*/(strchr(name, ':') &&
-		       strspn(name, "0123456789abcdefABCDEF:.[]%") == strlen(name)) ||
-	      /*ipv4*/strspn(name, "0123456789.") == strlen(name)) &&
-	    !SSL_set_tlsext_host_name(rktrans->rktrans_ssl, name))
-		goto fail;
-#endif
-
-	r = SSL_connect(rktrans->rktrans_ssl);
-	if (r == 1) {
-		/* Connected, highly unlikely since this is a
-		 * non-blocking operation. */
-		rd_kafka_transport_connect_done(rktrans, NULL);
-		return 0;
-	}
-
-		
-	if (rd_kafka_transport_ssl_io_update(rktrans, r,
-					     errstr, errstr_size) == -1)
-		return -1;
-	
-	return 0;
-
- fail:
-	rd_kafka_ssl_error(NULL, rkb, errstr, errstr_size);
-	return -1;
-}
-
-
-static RD_UNUSED int
-rd_kafka_transport_ssl_io_event (rd_kafka_transport_t *rktrans, int events) {
-	int r;
-	char errstr[512];
-
-	if (events & POLLOUT) {
-		r = SSL_write(rktrans->rktrans_ssl, NULL, 0);
-		if (rd_kafka_transport_ssl_io_update(rktrans, r,
-						     errstr,
-						     sizeof(errstr)) == -1)
-			goto fail;
-	}
-
-	return 0;
-
- fail:
-	/* Permanent error */
-	rd_kafka_broker_fail(rktrans->rktrans_rkb, LOG_ERR,
-                             RD_KAFKA_RESP_ERR__TRANSPORT,
-			     "%s", errstr);
-	return -1;
-}
-
-
-/**
- * Verify SSL handshake was valid.
- */
-static int rd_kafka_transport_ssl_verify (rd_kafka_transport_t *rktrans) {
-	long int rl;
-	X509 *cert;
-
-	cert = SSL_get_peer_certificate(rktrans->rktrans_ssl);
-	X509_free(cert);
-	if (!cert) {
-		rd_kafka_broker_fail(rktrans->rktrans_rkb, LOG_ERR,
-				     RD_KAFKA_RESP_ERR__SSL,
-				     "Broker did not provide a certificate");
-		return -1;
-	}
-
-	if ((rl = SSL_get_verify_result(rktrans->rktrans_ssl)) != X509_V_OK) {
-		rd_kafka_broker_fail(rktrans->rktrans_rkb, LOG_ERR,
-				     RD_KAFKA_RESP_ERR__SSL,
-				     "Failed to verify broker certificate: %s",
-				     X509_verify_cert_error_string(rl));
-		return -1;
-	}
-
-	rd_rkb_dbg(rktrans->rktrans_rkb, SECURITY, "SSLVERIFY",
-		   "Broker SSL certificate verified");
-	return 0;
-}
-
-/**
- * SSL handshake handling.
- * Call repeatedly (based on IO events) until handshake is done.
- *
- * Returns -1 on error, 0 if handshake is still in progress, or 1 on completion.
- */
-static int rd_kafka_transport_ssl_handshake (rd_kafka_transport_t *rktrans) {
-	rd_kafka_broker_t *rkb = rktrans->rktrans_rkb;
-	char errstr[512];
-	int r;
-
-	r = SSL_do_handshake(rktrans->rktrans_ssl);
-	if (r == 1) {
-		/* SSL handshake done. Verify. */
-		if (rd_kafka_transport_ssl_verify(rktrans) == -1)
-			return -1;
-
-		rd_kafka_transport_connect_done(rktrans, NULL);
-		return 1;
-
-	} else if (rd_kafka_transport_ssl_io_update(rktrans, r,
-						    errstr,
-						    sizeof(errstr)) == -1) {
-		rd_kafka_broker_fail(rkb, LOG_ERR, RD_KAFKA_RESP_ERR__SSL,
-				     "SSL handshake failed: %s%s", errstr,
-				     strstr(errstr, "unexpected message") ?
-				     ": client authentication might be "
-				     "required (see broker log)" : "");
-		return -1;
-	}
-
-	return 0;
-}
-
-
-/**
- * Once per rd_kafka_t handle cleanup of OpenSSL
- *
- * Locality: any thread
- *
- * NOTE: rd_kafka_wrlock() MUST be held
- */
-void rd_kafka_transport_ssl_ctx_term (rd_kafka_t *rk) {
-	SSL_CTX_free(rk->rk_conf.ssl.ctx);
-	rk->rk_conf.ssl.ctx = NULL;
-}
-
-/**
- * Once per rd_kafka_t handle initialization of OpenSSL
- *
- * Locality: application thread
- *
- * NOTE: rd_kafka_wrlock() MUST be held
- */
-int rd_kafka_transport_ssl_ctx_init (rd_kafka_t *rk,
-				     char *errstr, size_t errstr_size) {
-	int r;
-	SSL_CTX *ctx;
-
-        if (errstr_size > 0)
-                errstr[0] = '\0';
-
-	ctx = SSL_CTX_new(SSLv23_client_method());
-        if (!ctx) {
-                rd_snprintf(errstr, errstr_size,
-                            "SSLv23_client_method() failed: ");
-                goto fail;
-        }
-
-#ifdef SSL_OP_NO_SSLv3
-	/* Disable SSLv3 (unsafe) */
-	SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv3);
-#endif
-
-	/* Key file password callback */
-	SSL_CTX_set_default_passwd_cb(ctx, rd_kafka_transport_ssl_passwd_cb);
-	SSL_CTX_set_default_passwd_cb_userdata(ctx, rk);
-
-	/* Ciphers */
-	if (rk->rk_conf.ssl.cipher_suites) {
-		rd_kafka_dbg(rk, SECURITY, "SSL",
-			     "Setting cipher list: %s",
-			     rk->rk_conf.ssl.cipher_suites);
-		if (!SSL_CTX_set_cipher_list(ctx,
-					     rk->rk_conf.ssl.cipher_suites)) {
-                        /* Set a string that will prefix the
-                         * the OpenSSL error message (which is lousy)
-                         * to make it more meaningful. */
-                        rd_snprintf(errstr, errstr_size,
-                                    "ssl.cipher.suites failed: ");
-                        goto fail;
-		}
-	}
-
-
-	if (rk->rk_conf.ssl.ca_location) {
-		/* CA certificate location, either file or directory. */
-		int is_dir = rd_kafka_path_is_dir(rk->rk_conf.ssl.ca_location);
-
-		rd_kafka_dbg(rk, SECURITY, "SSL",
-			     "Loading CA certificate(s) from %s %s",
-			     is_dir ? "directory":"file",
-			     rk->rk_conf.ssl.ca_location);
-		
-		r = SSL_CTX_load_verify_locations(ctx,
-						  !is_dir ?
-						  rk->rk_conf.ssl.
-						  ca_location : NULL,
-						  is_dir ?
-						  rk->rk_conf.ssl.
-						  ca_location : NULL);
-
-                if (r != 1) {
-                        rd_snprintf(errstr, errstr_size,
-                                    "ssl.ca.location failed: ");
-                        goto fail;
-                }
-        } else {
-                /* Use default CA certificate paths: ignore failures. */
-                r = SSL_CTX_set_default_verify_paths(ctx);
-                if (r != 1)
-                        rd_kafka_dbg(rk, SECURITY, "SSL",
-                                     "SSL_CTX_set_default_verify_paths() "
-                                     "failed: ignoring");
-        }
-
-	if (rk->rk_conf.ssl.crl_location) {
-		rd_kafka_dbg(rk, SECURITY, "SSL",
-			     "Loading CRL from file %s",
-			     rk->rk_conf.ssl.crl_location);
-
-		r = SSL_CTX_load_verify_locations(ctx,
-						  rk->rk_conf.ssl.crl_location,
-						  NULL);
-
-                if (r != 1) {
-                        rd_snprintf(errstr, errstr_size,
-                                    "ssl.crl.location failed: ");
-                        goto fail;
-                }
-
-
-		rd_kafka_dbg(rk, SECURITY, "SSL",
-			     "Enabling CRL checks");
-
-		X509_STORE_set_flags(SSL_CTX_get_cert_store(ctx),
-				     X509_V_FLAG_CRL_CHECK);
-	}
-
-	if (rk->rk_conf.ssl.cert_location) {
-		rd_kafka_dbg(rk, SECURITY, "SSL",
-			     "Loading certificate from file %s",
-			     rk->rk_conf.ssl.cert_location);
-
-		r = SSL_CTX_use_certificate_chain_file(ctx,
-						       rk->rk_conf.ssl.cert_location);
-
-                if (r != 1) {
-                        rd_snprintf(errstr, errstr_size,
-                                    "ssl.certificate.location failed: ");
-                        goto fail;
-                }
-	}
-
-	if (rk->rk_conf.ssl.key_location) {
-		rd_kafka_dbg(rk, SECURITY, "SSL",
-			     "Loading private key file from %s",
-			     rk->rk_conf.ssl.key_location);
-
-		r = SSL_CTX_use_PrivateKey_file(ctx,
-						rk->rk_conf.ssl.key_location,
-						SSL_FILETYPE_PEM);
-                if (r != 1) {
-                        rd_snprintf(errstr, errstr_size,
-                                    "ssl.key.location failed: ");
-                        goto fail;
-                }
-	}
-
-	if (rk->rk_conf.ssl.keystore_location) {
-		FILE *fp;
-		EVP_PKEY *pkey;
-		X509 *cert;
-		STACK_OF(X509) *ca = NULL;
-		PKCS12 *p12;
-
-		rd_kafka_dbg(rk, SECURITY, "SSL",
-			     "Loading client's keystore file from %s",
-			     rk->rk_conf.ssl.keystore_location);
-
-		if (!(fp = fopen(rk->rk_conf.ssl.keystore_location, "rb"))) {
-			rd_snprintf(errstr, errstr_size,
-				    "Failed to open ssl.keystore.location: %s: %s", 
-				    rk->rk_conf.ssl.keystore_location, 
-				    rd_strerror(errno));
-			goto fail;
-		}
-
-		p12 = d2i_PKCS12_fp(fp, NULL);
-		fclose(fp);
-		if (!p12) {
-			rd_snprintf(errstr, errstr_size,
-				    "Error reading PKCS#12 file: ");
-			goto fail;
-		}
-
-		pkey = EVP_PKEY_new();
-		cert = X509_new();
-		if (!PKCS12_parse(p12, rk->rk_conf.ssl.keystore_password, &pkey, &cert, &ca)) {
-			EVP_PKEY_free(pkey);
-			X509_free(cert);
-			PKCS12_free(p12);
-			if (ca != NULL)
-				sk_X509_pop_free(ca, X509_free);
-			rd_snprintf(errstr, errstr_size,
-				    "Failed to parse PKCS#12 file: %s: ",
-				    rk->rk_conf.ssl.keystore_location);
-			goto fail;
-		}
-
-		if (ca != NULL)
-			sk_X509_pop_free(ca, X509_free);
-
-		PKCS12_free(p12);
-
-		r = SSL_CTX_use_certificate(ctx, cert);
-		X509_free(cert);
-		if (r != 1) {
-			EVP_PKEY_free(pkey);
-			rd_snprintf(errstr, errstr_size,
-				    "Failed to use ssl.keystore.location certificate: ");
-			goto fail;
-		}
-
-		r = SSL_CTX_use_PrivateKey(ctx, pkey);
-		EVP_PKEY_free(pkey);
-		if (r != 1) {
-			rd_snprintf(errstr, errstr_size,
-				    "Failed to use ssl.keystore.location private key: ");
-			goto fail;
-		}
-	}
-
-	SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE);
-
-	rk->rk_conf.ssl.ctx = ctx;
-	return 0;
-
- fail:
-        r = (int)strlen(errstr);
-        rd_kafka_ssl_error(rk, NULL, errstr+r,
-                           (int)errstr_size > r ? (int)errstr_size - r : 0);
-	SSL_CTX_free(ctx);
-
-	return -1;
-}
-
-
-#endif /* WITH_SSL */
 
 
 ssize_t
 rd_kafka_transport_send (rd_kafka_transport_t *rktrans,
                          rd_slice_t *slice, char *errstr, size_t errstr_size) {
-
+        ssize_t r;
 #if WITH_SSL
-        if (rktrans->rktrans_ssl)
-                return rd_kafka_transport_ssl_send(rktrans, slice,
-                                                   errstr, errstr_size);
-        else
+        if (rktrans->rktrans_ssl) {
+                rd_kafka_curr_transport = rktrans;
+                r = rd_kafka_transport_ssl_send(rktrans, slice,
+                                                errstr, errstr_size);
+        } else
 #endif
-                return rd_kafka_transport_socket_send(rktrans, slice,
-                                                      errstr, errstr_size);
+                r = rd_kafka_transport_socket_send(rktrans, slice,
+                                                   errstr, errstr_size);
+
+        return r;
 }
 
 
 ssize_t
 rd_kafka_transport_recv (rd_kafka_transport_t *rktrans, rd_buf_t *rbuf,
                          char *errstr, size_t errstr_size) {
+        ssize_t r;
+
 #if WITH_SSL
-	if (rktrans->rktrans_ssl)
-                return rd_kafka_transport_ssl_recv(rktrans, rbuf,
-                                                   errstr, errstr_size);
-	else
+        if (rktrans->rktrans_ssl) {
+                rd_kafka_curr_transport = rktrans;
+                r = rd_kafka_transport_ssl_recv(rktrans, rbuf,
+                                                errstr, errstr_size);
+        } else
 #endif
-                return rd_kafka_transport_socket_recv(rktrans, rbuf,
-                                                      errstr, errstr_size);
+                r = rd_kafka_transport_socket_recv(rktrans, rbuf,
+                                                   errstr, errstr_size);
+
+        return r;
 }
 
 
@@ -1221,15 +611,15 @@ static void rd_kafka_transport_connected (rd_kafka_transport_t *rktrans) {
 
 
 #ifdef TCP_NODELAY
-	if (rkb->rkb_rk->rk_conf.socket_nagle_disable) {
-		int one = 1;
-		if (setsockopt(rktrans->rktrans_s, IPPROTO_TCP, TCP_NODELAY,
-			       (void *)&one, sizeof(one)) == SOCKET_ERROR)
-			rd_rkb_log(rkb, LOG_WARNING, "NAGLE",
-				   "Failed to disable Nagle (TCP_NODELAY) "
-				   "on socket %d: %s",
-				   socket_strerror(socket_errno));
-	}
+        if (rkb->rkb_rk->rk_conf.socket_nagle_disable) {
+                int one = 1;
+                if (setsockopt(rktrans->rktrans_s, IPPROTO_TCP, TCP_NODELAY,
+                               (void *)&one, sizeof(one)) == SOCKET_ERROR)
+                        rd_rkb_log(rkb, LOG_WARNING, "NAGLE",
+                                   "Failed to disable Nagle (TCP_NODELAY) "
+                                   "on socket: %s",
+                                   socket_strerror(socket_errno));
+        }
 #endif
 
 
@@ -1333,21 +723,37 @@ static void rd_kafka_transport_io_event (rd_kafka_transport_t *rktrans,
 		}
 		break;
 
-	case RD_KAFKA_BROKER_STATE_AUTH:
-		/* SASL handshake */
-		if (rd_kafka_sasl_io_event(rktrans, events,
-					   errstr, sizeof(errstr)) == -1) {
-			errno = EINVAL;
-			rd_kafka_broker_fail(rkb, LOG_ERR,
-					     RD_KAFKA_RESP_ERR__AUTHENTICATION,
-					     "SASL authentication failure: %s",
-					     errstr);
-			return;
-		}
-		break;
+        case RD_KAFKA_BROKER_STATE_AUTH_LEGACY:
+                /* SASL authentication.
+                 * Prior to broker version v1.0.0 this is performed
+                 * directly on the socket without Kafka framing. */
+                if (rd_kafka_sasl_io_event(rktrans, events,
+                                           errstr,
+                                           sizeof(errstr)) == -1) {
+                        errno = EINVAL;
+                        rd_kafka_broker_fail(
+                                rkb, LOG_ERR,
+                                RD_KAFKA_RESP_ERR__AUTHENTICATION,
+                                "SASL authentication failure: %s",
+                                errstr);
+                        return;
+                }
+
+                if (events & POLLHUP) {
+                        errno = EINVAL;
+                        rd_kafka_broker_fail(
+                                rkb, LOG_ERR,
+                                RD_KAFKA_RESP_ERR__AUTHENTICATION,
+                                "Disconnected");
+
+                        return;
+                }
+
+                break;
 
 	case RD_KAFKA_BROKER_STATE_APIVERSION_QUERY:
 	case RD_KAFKA_BROKER_STATE_AUTH_HANDSHAKE:
+                case RD_KAFKA_BROKER_STATE_AUTH_REQ:
 	case RD_KAFKA_BROKER_STATE_UP:
 	case RD_KAFKA_BROKER_STATE_UPDATE:
 
@@ -1355,17 +761,18 @@ static void rd_kafka_transport_io_event (rd_kafka_transport_t *rktrans,
 			while (rkb->rkb_state >= RD_KAFKA_BROKER_STATE_UP &&
 			       rd_kafka_recv(rkb) > 0)
 				;
+
+                        /* If connection went down: bail out early */
+                        if (rkb->rkb_state == RD_KAFKA_BROKER_STATE_DOWN)
+                                return;
 		}
 
-		if (events & POLLHUP) {
-			rd_kafka_broker_fail(rkb,
-                                             rkb->rkb_rk->rk_conf.
-                                             log_connection_close ?
-                                             LOG_NOTICE : LOG_DEBUG,
-                                             RD_KAFKA_RESP_ERR__TRANSPORT,
-					     "Connection closed");
-			return;
-		}
+                if (events & POLLHUP) {
+                        rd_kafka_broker_conn_closed(
+                                rkb, RD_KAFKA_RESP_ERR__TRANSPORT,
+                                "Disconnected");
+                        return;
+                }
 
 		if (events & POLLOUT) {
 			while (rd_kafka_send(rkb) > 0)
@@ -1375,31 +782,46 @@ static void rd_kafka_transport_io_event (rd_kafka_transport_t *rktrans,
 
 	case RD_KAFKA_BROKER_STATE_INIT:
 	case RD_KAFKA_BROKER_STATE_DOWN:
+        case RD_KAFKA_BROKER_STATE_TRY_CONNECT:
 		rd_kafka_assert(rkb->rkb_rk, !*"bad state");
 	}
 }
 
 
 /**
- * Poll and serve IOs
+ * @brief Poll and serve IOs
  *
- * Locality: broker thread 
+ * @returns 1 if at least one IO event was triggered, else 0, or -1 on error.
+ *
+ * @locality broker thread
  */
-void rd_kafka_transport_io_serve (rd_kafka_transport_t *rktrans,
+int rd_kafka_transport_io_serve (rd_kafka_transport_t *rktrans,
                                   int timeout_ms) {
 	rd_kafka_broker_t *rkb = rktrans->rktrans_rkb;
-	int events;
+        int events;
+        int r;
 
-	if (rd_kafka_bufq_cnt(&rkb->rkb_waitresps) < rkb->rkb_max_inflight &&
-	    rd_kafka_bufq_cnt(&rkb->rkb_outbufs) > 0)
-		rd_kafka_transport_poll_set(rkb->rkb_transport, POLLOUT);
+        rd_kafka_curr_transport = rktrans;
 
-	if ((events = rd_kafka_transport_poll(rktrans, timeout_ms)) <= 0)
-                return;
+        if (rkb->rkb_state == RD_KAFKA_BROKER_STATE_CONNECT ||
+            (rkb->rkb_state > RD_KAFKA_BROKER_STATE_CONNECT &&
+             rd_kafka_bufq_cnt(&rkb->rkb_waitresps) < rkb->rkb_max_inflight &&
+             rd_kafka_bufq_cnt(&rkb->rkb_outbufs) > 0))
+                rd_kafka_transport_poll_set(rkb->rkb_transport, POLLOUT);
 
-        rd_kafka_transport_poll_clear(rktrans, POLLOUT);
+        if ((r = rd_kafka_transport_poll(rktrans, timeout_ms)) <= 0)
+                return r;
 
-	rd_kafka_transport_io_event(rktrans, events);
+        /* Only handle events on the broker socket, the wakeup
+         * socket is just for waking up the blocking boll. */
+        events = rktrans->rktrans_pfd[0].revents;
+        if (events) {
+                rd_kafka_transport_poll_clear(rktrans, POLLOUT);
+
+                rd_kafka_transport_io_event(rktrans, events);
+        }
+
+        return 1;
 }
 
 
@@ -1437,20 +859,16 @@ rd_kafka_transport_t *rd_kafka_transport_connect (rd_kafka_broker_t *rkb,
 			   socket_strerror(socket_errno));
 #endif
 
-	/* Enable TCP keep-alives, if configured. */
-	if (rkb->rkb_rk->rk_conf.socket_keepalive) {
 #ifdef SO_KEEPALIVE
-		if (setsockopt(s, SOL_SOCKET, SO_KEEPALIVE,
-			       (void *)&on, sizeof(on)) == SOCKET_ERROR)
-			rd_rkb_dbg(rkb, BROKER, "SOCKET",
-				   "Failed to set SO_KEEPALIVE: %s",
-				   socket_strerror(socket_errno));
-#else
-		rd_rkb_dbg(rkb, BROKER, "SOCKET",
-			   "System does not support "
-			   "socket.keepalive.enable (SO_KEEPALIVE)");
+        /* Enable TCP keep-alives, if configured. */
+        if (rkb->rkb_rk->rk_conf.socket_keepalive) {
+                if (setsockopt(s, SOL_SOCKET, SO_KEEPALIVE,
+                               (void *)&on, sizeof(on)) == SOCKET_ERROR)
+                        rd_rkb_dbg(rkb, BROKER, "SOCKET",
+                                   "Failed to set SO_KEEPALIVE: %s",
+                                   socket_strerror(socket_errno));
+        }
 #endif
-	}
 
         /* Set the socket to non-blocking */
         if ((r = rd_fd_set_nonblocking(s))) {
@@ -1468,9 +886,11 @@ rd_kafka_transport_t *rd_kafka_transport_connect (rd_kafka_broker_t *rkb,
 
 	/* Connect to broker */
         if (rkb->rkb_rk->rk_conf.connect_cb) {
+                rd_kafka_broker_lock(rkb); /* for rkb_nodename */
                 r = rkb->rkb_rk->rk_conf.connect_cb(
                         s, (struct sockaddr *)sinx, RD_SOCKADDR_INX_LEN(sinx),
-                        rkb->rkb_name, rkb->rkb_rk->rk_conf.opaque);
+                        rkb->rkb_nodename, rkb->rkb_rk->rk_conf.opaque);
+                rd_kafka_broker_unlock(rkb);
         } else {
                 if (connect(s, (struct sockaddr *)sinx,
                             RD_SOCKADDR_INX_LEN(sinx)) == SOCKET_ERROR &&
@@ -1531,7 +951,11 @@ void rd_kafka_transport_poll_clear(rd_kafka_transport_t *rktrans, int event) {
 	rktrans->rktrans_pfd[0].events &= ~event;
 }
 
-
+/**
+ * @brief Poll transport fds.
+ *
+ * @returns 1 if an event was raised, else 0, or -1 on error.
+ */
 int rd_kafka_transport_poll(rd_kafka_transport_t *rktrans, int tmout) {
         int r;
 #ifndef _MSC_VER
@@ -1571,14 +995,13 @@ int rd_kafka_transport_poll(rd_kafka_transport_t *rktrans, int tmout) {
 
         if (rktrans->rktrans_pfd[1].revents & POLLIN) {
                 /* Read wake-up fd data and throw away, just used for wake-ups*/
-                char buf[512];
-                if (rd_read((int)rktrans->rktrans_pfd[1].fd,
-                            buf, sizeof(buf)) == -1) {
-                        /* Ignore warning */
-                }
+                char buf[1024];
+                while (rd_read((int)rktrans->rktrans_pfd[1].fd,
+                               buf, sizeof(buf)) > 0)
+                        ; /* Read all buffered signalling bytes */
         }
 
-        return rktrans->rktrans_pfd[0].revents;
+        return 1;
 }
 
 
@@ -1598,8 +1021,8 @@ void rd_kafka_transport_term (void) {
 #endif
 }
 #endif
- 
-void rd_kafka_transport_init(void) {
+
+void rd_kafka_transport_init (void) {
 #ifdef _MSC_VER
 	WSADATA d;
 	(void)WSAStartup(MAKEWORD(2, 2), &d);

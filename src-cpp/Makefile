@@ -5,7 +5,7 @@ LIBVER=		1
 CXXSRCS=	RdKafka.cpp ConfImpl.cpp HandleImpl.cpp \
 		ConsumerImpl.cpp ProducerImpl.cpp KafkaConsumerImpl.cpp \
 		TopicImpl.cpp TopicPartitionImpl.cpp MessageImpl.cpp \
-		QueueImpl.cpp MetadataImpl.cpp
+		HeadersImpl.cpp QueueImpl.cpp MetadataImpl.cpp
 
 HDRS=		rdkafkacpp.h
 
@@ -43,6 +43,7 @@ file-check: lib
 check: file-check
 
 install: lib-install
+uninstall: lib-uninstall
 
 clean: lib-clean
 

@@ -41,7 +41,6 @@ extern const char *rd_kafka_fetch_states[];
 struct offset_stats {
         int64_t fetch_offset; /**< Next offset to fetch */
         int64_t eof_offset;   /**< Last offset we reported EOF for */
-        int64_t hi_offset;    /**< Current broker hi offset */
 };
 
 /**
@@ -50,10 +49,22 @@ struct offset_stats {
 static RD_UNUSED void rd_kafka_offset_stats_reset (struct offset_stats *offs) {
         offs->fetch_offset = 0;
         offs->eof_offset = RD_KAFKA_OFFSET_INVALID;
-        offs->hi_offset = RD_KAFKA_OFFSET_INVALID;
 }
 
 
+/**
+ * @brief Store information about a partition error for future use.
+ */
+struct rd_kafka_toppar_err {
+        rd_kafka_resp_err_t err;  /**< Error code */
+        int actions;              /**< Request actions */
+        rd_ts_t ts;               /**< Timestamp */
+        uint64_t base_msgid;      /**< First msg msgid */
+        int32_t base_seq;         /**< Idempodent Producer:
+                                   *   first msg sequence */
+        int32_t last_seq;         /**< Idempotent Producer:
+                                   *   last msg sequence */
+};
 
 /**
  * Topic + Partition combination
@@ -85,7 +96,7 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
 
         //LOCK: toppar_lock. toppar_insert_msg(), concat_msgq()
         //LOCK: toppar_lock. toppar_enq_msg(), deq_msg(), toppar_retry_msgq()
-        int                rktp_msgq_wakeup_fd; /* Wake-up fd */
+        rd_kafka_q_t      *rktp_msgq_wakeup_q;  /**< Wake-up queue */
 	rd_kafka_msgq_t    rktp_msgq;      /* application->rdkafka queue.
 					    * protected by rktp_lock */
         rd_kafka_msgq_t    rktp_xmit_msgq; /* internal broker xmit queue.
@@ -99,16 +110,69 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
                                                   * Broker thread -> App */
         rd_kafka_q_t      *rktp_ops;             /* * -> Main thread */
 
-        uint64_t           rktp_msgseq;     /* Current message sequence number.
-                                             * Each message enqueued on a
-                                             * non-UA partition will get a
-                                             * unique sequencial number assigned.
-                                             * This number is used to
-                                             * re-enqueue the message
-                                             * on resends but making sure
-                                             * the input ordering is still
-                                             * maintained.
-                                             * Starts at 1. */
+        rd_atomic32_t      rktp_msgs_inflight;  /**< Current number of
+                                                 *   messages in-flight to/from
+                                                 *   the broker. */
+
+        uint64_t           rktp_msgid;   /**< Current/last message id.
+                                          *   Each message enqueued on a
+                                          *   non-UA partition will get a
+                                          *   partition-unique sequencial
+                                          *   number assigned.
+                                          *   This number is used to
+                                          *   re-enqueue the message
+                                          *   on resends but making sure
+                                          *   the input ordering is still
+                                          *   maintained, and used by
+                                          *   the idempotent producer.
+                                          *   Starts at 1.
+                                          *   Protected by toppar_lock */
+        struct {
+                rd_kafka_pid_t pid;      /**< Partition's last known
+                                          *   Producer Id and epoch.
+                                          *   Protected by toppar lock.
+                                          *   Only updated in toppar
+                                          *   handler thread. */
+                uint64_t acked_msgid;    /**< Highest acknowledged message.
+                                          *   Protected by toppar lock. */
+                uint64_t epoch_base_msgid; /**< This Producer epoch's
+                                          *   base msgid.
+                                          *   When a new epoch is
+                                          *   acquired the base_seq
+                                          *   is set to the current
+                                          *   rktp_msgid so that
+                                          *   sub-sequent produce
+                                          *   requests will have
+                                          *   a sequence number series
+                                          *   starting at 0.
+                                          *   Only accessed from
+                                          *   toppar handler thread. */
+                int32_t next_ack_seq;    /**< Next expected ack sequence.
+                                          *   Protected by toppar lock. */
+                int32_t next_err_seq;    /**< Next expected error sequence.
+                                          *   Used when draining outstanding
+                                          *   issues.
+                                          *   This value will be the same
+                                          *   as next_ack_seq until a drainable
+                                          *   error occurs, in which case it
+                                          *   will advance past next_ack_seq.
+                                          *   next_ack_seq can never be larger
+                                          *   than next_err_seq.
+                                          *   Protected by toppar lock. */
+                rd_bool_t wait_drain;    /**< All inflight requests must
+                                          *   be drained/finish before
+                                          *   resuming producing.
+                                          *   This is set to true
+                                          *   when a leader change
+                                          *   happens so that the
+                                          *   in-flight messages for the
+                                          *   old brokers finish before
+                                          *   the new broker starts sending.
+                                          *   This as a step to ensure
+                                          *   consistency.
+                                          *   Only accessed from toppar
+                                          *   handler thread. */
+        } rktp_eos;
 
 	/**
 	 * rktp version barriers
@@ -183,8 +247,11 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
 	int64_t            rktp_last_next_offset; /* Last next_offset handled
 						   * by fetch_decide().
 						   * Locality: broker thread */
-	int64_t            rktp_app_offset;      /* Last offset delivered to
-						  * application + 1 */
+        int64_t            rktp_app_offset;      /* Last offset delivered to
+                                                  * application + 1.
+                                                  * Is reset to INVALID_OFFSET
+                                                  * when partition is
+                                                  * unassigned/stopped. */
 	int64_t            rktp_stored_offset;   /* Last stored offset, but
 						  * maybe not committed yet. */
         int64_t            rktp_committing_offset; /* Offset currently being
@@ -200,7 +267,9 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
                                                * by broker thread.
                                                * Locks: toppar_lock */
 
-	int64_t rktp_hi_offset;              /* Current high offset.
+        int64_t rktp_ls_offset;              /**< Current last stable offset
+                                              *   Locks: toppar_lock */
+	int64_t rktp_hi_offset;              /* Current high watermark offset.
 					      * Locks: toppar_lock */
         int64_t rktp_lo_offset;              /* Current broker low offset.
                                               * This is outside of the stats
@@ -228,8 +297,8 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
 	int                rktp_flags;
 #define RD_KAFKA_TOPPAR_F_DESIRED  0x1      /* This partition is desired
 					     * by a consumer. */
-#define RD_KAFKA_TOPPAR_F_UNKNOWN  0x2      /* Topic is (not yet) seen on
-					     * a broker. */
+#define RD_KAFKA_TOPPAR_F_UNKNOWN  0x2      /* Topic is not yet or no longer
+                                             * seen on a broker. */
 #define RD_KAFKA_TOPPAR_F_OFFSET_STORE 0x4  /* Offset store is active */
 #define RD_KAFKA_TOPPAR_F_OFFSET_STORE_STOPPING 0x8 /* Offset store stopping */
 #define RD_KAFKA_TOPPAR_F_APP_PAUSE  0x10   /* App pause()d consumption */
@@ -259,12 +328,18 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
         int rktp_wait_consumer_lag_resp;         /* Waiting for consumer lag
                                                   * response. */
 
-	struct {
-		rd_atomic64_t tx_msgs;
-		rd_atomic64_t tx_bytes;
-                rd_atomic64_t msgs;
-                rd_atomic64_t rx_ver_drops;
-	} rktp_c;
+        struct rd_kafka_toppar_err rktp_last_err; /**< Last produce error */
+
+
+        struct {
+                rd_atomic64_t tx_msgs;       /**< Producer: sent messages */
+                rd_atomic64_t tx_msg_bytes;  /**<  .. bytes */
+                rd_atomic64_t rx_msgs;       /**< Consumer: received messages */
+                rd_atomic64_t rx_msg_bytes;  /**<  .. bytes */
+                rd_atomic64_t producer_enq_msgs; /**< Producer: enqueued msgs */
+                rd_atomic64_t rx_ver_drops;  /**< Consumer: outdated message
+                                              *             drops. */
+        } rktp_c;
 
 };
 
@@ -332,17 +407,17 @@ void rd_kafka_toppar_set_fetch_state (rd_kafka_toppar_t *rktp,
                                       int fetch_state);
 void rd_kafka_toppar_insert_msg (rd_kafka_toppar_t *rktp, rd_kafka_msg_t *rkm);
 void rd_kafka_toppar_enq_msg (rd_kafka_toppar_t *rktp, rd_kafka_msg_t *rkm);
-void rd_kafka_toppar_deq_msg (rd_kafka_toppar_t *rktp, rd_kafka_msg_t *rkm);
 int rd_kafka_retry_msgq (rd_kafka_msgq_t *destq,
                          rd_kafka_msgq_t *srcq,
                          int incr_retry, int max_retries, rd_ts_t backoff,
+                         rd_kafka_msg_status_t status,
                          int (*cmp) (const void *a, const void *b));
 void rd_kafka_msgq_insert_msgq (rd_kafka_msgq_t *destq,
                                 rd_kafka_msgq_t *srcq,
                                 int (*cmp) (const void *a, const void *b));
 int  rd_kafka_toppar_retry_msgq (rd_kafka_toppar_t *rktp,
                                  rd_kafka_msgq_t *rkmq,
-                                 int incr_retry);
+                                 int incr_retry, rd_kafka_msg_status_t status);
 void rd_kafka_toppar_insert_msgq (rd_kafka_toppar_t *rktp,
                                   rd_kafka_msgq_t *rkmq);
 void rd_kafka_toppar_enq_error (rd_kafka_toppar_t *rktp,
@@ -376,9 +451,6 @@ void rd_kafka_toppar_desired_del (rd_kafka_toppar_t *rktp);
 
 void rd_kafka_toppar_next_offset_handle (rd_kafka_toppar_t *rktp,
                                          int64_t Offset);
-
-void rd_kafka_toppar_offset_commit (rd_kafka_toppar_t *rktp, int64_t offset,
-				    const char *metadata);
 
 void rd_kafka_toppar_broker_delegate (rd_kafka_toppar_t *rktp,
 				      rd_kafka_broker_t *rkb,
@@ -433,8 +505,9 @@ void rd_kafka_toppar_leader_unavailable (rd_kafka_toppar_t *rktp,
                                          rd_kafka_resp_err_t err);
 
 rd_kafka_resp_err_t
-rd_kafka_toppars_pause_resume (rd_kafka_t *rk, int pause, int flag,
-			       rd_kafka_topic_partition_list_t *partitions);
+rd_kafka_toppars_pause_resume (rd_kafka_t *rk,
+                               rd_bool_t pause, rd_async_t async, int flag,
+                               rd_kafka_topic_partition_list_t *partitions);
 
 
 rd_kafka_topic_partition_t *rd_kafka_topic_partition_new (const char *topic,
@@ -570,7 +643,7 @@ int rd_kafka_toppar_ver_cmp (const void *_a, const void *_b) {
 				   rktp_b->rktp_rkt->rkt_topic)))
 		return r;
 
-	return rktp_a->rktp_partition - rktp_b->rktp_partition;
+        return RD_CMP(rktp_a->rktp_partition, rktp_b->rktp_partition);
 }
 
 /**
@@ -637,5 +710,13 @@ int rd_kafka_partition_leader_cmp (const void *_a, const void *_b) {
         const struct rd_kafka_partition_leader *a = _a, *b = _b;
         return rd_kafka_broker_cmp(a->rkb, b->rkb);
 }
+
+int rd_kafka_toppar_pid_change (rd_kafka_toppar_t *rktp, rd_kafka_pid_t pid,
+                                uint64_t base_msgid);
+
+int rd_kafka_toppar_handle_purge_queues (rd_kafka_toppar_t *rktp,
+                                         rd_kafka_broker_t *rkb,
+                                         int purge_flags);
+void rd_kafka_purge_ua_toppar_queues (rd_kafka_t *rk);
 
 #endif /* _RDKAFKA_PARTITION_H_ */

@@ -49,7 +49,7 @@ function checks {
 	    mkl_mkvar_append CPPFLAGS CPPFLAGS "-m$MBITS"
 	    mkl_mkvar_append LDFLAGS LDFLAGS "-m$MBITS"
 	fi
-	if [[ -z "$ARFLAGS" && $MBITS == 64 && $MKL_DISTRO == "SunOS" ]]; then
+	if [[ -z "$ARFLAGS" && $MBITS == 64 && $MKL_DISTRO == "sunos" ]]; then
 	    # Turn on 64-bit archives on SunOS
 	    mkl_mkvar_append ARFLAGS ARFLAGS "S"
 	fi
@@ -105,11 +105,11 @@ function checks {
     fi
     mkl_mkvar_set "pkgconfig" PKG_CONFIG $PKG_CONFIG
 
-    [[ ! -z "$PKG_CONFIG_PATH" ]] && mkl_env_append PKG_CONFIG_PATH "$PKG_CONFIG_PATH"
+    [[ ! -z "$append_PKG_CONFIG_PATH" ]] && mkl_env_append PKG_CONFIG_PATH "$append_PKG_CONFIG_PATH" ":"
 
     # install
     if [ -z "$INSTALL" ]; then
-	if [[ $MKL_DISTRO == "SunOS" ]]; then
+	if [[ $MKL_DISTRO == "sunos" ]]; then
 	    mkl_meta_set ginstall name "GNU install"
 	    if mkl_command_check ginstall "" ignore "ginstall --version"; then
 		INSTALL=ginstall
@@ -169,7 +169,7 @@ for n in CFLAGS CPPFLAGS CXXFLAGS LDFLAGS ARFLAGS; do
     mkl_option "Compiler" "mk:$n" "--$n=$n" "Add $n flags"
 done
 
-mkl_option "Compiler" "env:PKG_CONFIG_PATH" "--pkg-config-path" "Extra paths for pkg-config"
+mkl_option "Compiler" "env:append_PKG_CONFIG_PATH" "--pkg-config-path=EXTRA_PATHS" "Extra paths for pkg-config"
 
 mkl_option "Compiler" "WITH_PROFILING" "--enable-profiling" "Enable profiling"
 mkl_option "Compiler" "WITH_STATIC_LINKING" "--enable-static" "Enable static linking"

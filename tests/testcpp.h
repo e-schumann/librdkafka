@@ -35,8 +35,10 @@
 extern "C" {
 #ifdef _MSC_VER
 /* Win32/Visual Studio */
+#include "../src/win32_config.h"
 #include "../src/rdwin32.h"
 #else
+#include "../config.h"
 /* POSIX / UNIX based systems */
 #include "../src/rdposix.h"
 #endif
@@ -57,6 +59,11 @@ struct tostr {
 
 
 
+#define TestMessageVerify(testid,exp_partition,msgidp,msg)              \
+        test_msg_parse00(__FUNCTION__, __LINE__, testid, exp_partition, \
+                         msgidp, (msg)->topic_name().c_str(),           \
+                         (msg)->partition(), (msg)->offset(),           \
+                         (const char *)(msg)->key_pointer(), (msg)->key_len())
 
 namespace Test {
 
@@ -69,6 +76,9 @@ namespace Test {
   }
   static RD_UNUSED void FailLater (std::string str) {
     test_FAIL(__FILE__, __LINE__, 0, str.c_str());
+  }
+  static RD_UNUSED void Skip (std::string str) {
+          test_SKIP(__FILE__, __LINE__, str.c_str());
   }
   static RD_UNUSED void Say (int level, std::string str) {
     test_SAY(__FILE__, __LINE__, level, str.c_str());
@@ -84,6 +94,27 @@ namespace Test {
                                               bool randomized) {
     return test_mk_topic_name(suffix.c_str(),
                               (int)randomized);
+  }
+
+  /**
+   * @brief Create a topic
+   */
+  static RD_UNUSED void create_topic (RdKafka::Handle *use_handle, const char *topicname,
+                                      int partition_cnt, int replication_factor) {
+    rd_kafka_t *use_rk = NULL;
+    if (use_handle != NULL)
+      use_rk = use_handle->c_ptr();
+    test_create_topic(use_rk, topicname, partition_cnt, replication_factor);
+  }
+
+  /**
+   * @brief Delete a topic
+   */
+  static RD_UNUSED void delete_topic (RdKafka::Handle *use_handle, const char *topicname) {
+    rd_kafka_t *use_rk = NULL;
+    if (use_handle != NULL)
+      use_rk = use_handle->c_ptr();
+    test_delete_topic(use_rk, topicname);
   }
 
   /**

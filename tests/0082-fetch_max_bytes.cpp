@@ -72,10 +72,15 @@ static void do_test_fetch_max_bytes (void) {
    * the consumer asked for 1000000 bytes and got 1000096 bytes batch, which
    * was higher than the 1000000 limit.
    * See https://github.com/edenhill/librdkafka/issues/1616
+   *
+   * With the added configuration strictness checks, a user-supplied
+   * value is no longer over-written:
+   * receive.message.max.bytes must be configured to be at least 512 bytes
+   * larger than fetch.max.bytes.
    */
   Test::conf_set(conf, "max.partition.fetch.bytes", "20000000"); /* ~20MB */
   Test::conf_set(conf, "fetch.max.bytes", "1000000"); /* ~1MB */
-  Test::conf_set(conf, "receive.message.max.bytes", "1000000"); /* ~1MB+ */
+  Test::conf_set(conf, "receive.message.max.bytes", "1000512"); /* ~1MB+512 */
 
   RdKafka::KafkaConsumer *c = RdKafka::KafkaConsumer::create(conf, errstr);
   if (!c)
@@ -96,7 +101,6 @@ static void do_test_fetch_max_bytes (void) {
     switch (msg->err())
       {
       case RdKafka::ERR__TIMED_OUT:
-      case RdKafka::ERR__PARTITION_EOF:
         break;
 
       case RdKafka::ERR_NO_ERROR:
@@ -117,8 +121,14 @@ static void do_test_fetch_max_bytes (void) {
 }
 
 extern "C" {
-  int main_0081_fetch_max_bytes (int argc, char **argv) {
+  int main_0082_fetch_max_bytes (int argc, char **argv) {
+    if (test_quick) {
+      Test::Skip("Test skipped due to quick mode\n");
+      return 0;
+    }
+
     do_test_fetch_max_bytes();
+
     return 0;
   }
 }

@@ -16,12 +16,16 @@ mkl_require pic
 mkl_require atomics
 mkl_require good_cflags
 mkl_require socket
+mkl_require libzstd
+mkl_require libssl
+mkl_require libsasl2
 
 # Generate version variables from rdkafka.h hex version define
 # so we can use it as string version when generating a pkg-config file.
 
 verdef=$(grep '^#define  *RD_KAFKA_VERSION  *0x' src/rdkafka.h | sed 's/^#define  *RD_KAFKA_VERSION  *\(0x[a-f0-9]*\)\.*$/\1/')
 mkl_require parseversion hex2str "%d.%d.%d" "$verdef" RDKAFKA_VERSION_STR
+
 
 mkl_toggle_option "Development" ENABLE_DEVEL "--enable-devel" "Enable development asserts, checks, etc" "n"
 mkl_toggle_option "Development" ENABLE_VALGRIND "--enable-valgrind" "Enable in-code valgrind suppressions" "n"
@@ -30,10 +34,8 @@ mkl_toggle_option "Development" ENABLE_REFCNT_DEBUG "--enable-refcnt-debug" "Ena
 
 mkl_toggle_option "Development" ENABLE_SHAREDPTR_DEBUG "--enable-sharedptr-debug" "Enable sharedptr debugging" "n"
 
-mkl_toggle_option "Feature" ENABLE_LZ4_EXT "--enable-lz4" "Enable external LZ4 library support" "y"
-
-mkl_toggle_option "Feature" ENABLE_SSL "--enable-ssl" "Enable SSL support" "y"
-mkl_toggle_option "Feature" ENABLE_SASL "--enable-sasl" "Enable SASL support with Cyrus libsasl2" "y"
+mkl_toggle_option "Feature" ENABLE_LZ4_EXT "--enable-lz4-ext" "Enable external LZ4 library support" "y"
+mkl_toggle_option "Feature" ENABLE_LZ4_EXT "--enable-lz4" "Deprecated: alias for --enable-lz4-ext" "y"
 
 
 function checks {
@@ -41,9 +43,30 @@ function checks {
     # -lrt is needed on linux for clock_gettime: link it if it exists.
     mkl_lib_check "librt" "" cont CC "-lrt"
 
-    # required libs
+    # pthreads required (even if C11 threads available) for rwlocks.
     mkl_lib_check "libpthread" "" fail CC "-lpthread" \
                   "#include <pthread.h>"
+
+    # Use internal tinycthread if C11 threads not available.
+    # Requires -lpthread on glibc c11 threads, thus the use of $LIBS.
+    mkl_lib_check "c11threads" WITH_C11THREADS disable CC "$LIBS" \
+                  "
+#include <threads.h>
+
+
+static int start_func (void *arg) {
+   int iarg = *(int *)arg;
+   return iarg;
+}
+
+void foo (void) {
+    thrd_t thr;
+    int arg = 1;
+    if (thrd_create(&thr, start_func, (void *)&arg) != thrd_success) {
+      ;
+    }
+}
+"
 
     # Check if dlopen() is available
     mkl_lib_check "libdl" "WITH_LIBDL" disable CC "-ldl" \
@@ -63,14 +86,31 @@ void foo (void) {
     fi
 
     # optional libs
+    mkl_meta_set "zlib" "deb" "zlib1g-dev"
+    mkl_meta_set "zlib" "apk" "zlib-dev"
+    mkl_meta_set "zlib" "static" "libz.a"
     mkl_lib_check "zlib" "WITH_ZLIB" disable CC "-lz" \
                   "#include <zlib.h>"
-    mkl_lib_check "libcrypto" "" disable CC "-lcrypto"
+    mkl_check "libssl" disable
+    mkl_check "libsasl2" disable
+    mkl_check "libzstd" disable
 
-    if [[ "$ENABLE_LZ4_EXT" == "y" ]]; then
-        mkl_lib_check --static=-llz4 "liblz4" "WITH_LZ4_EXT" disable CC "-llz4" \
+    if mkl_lib_check "libm" "" disable CC "-lm" \
+                     "#include <math.h>"; then
+        mkl_allvar_set WITH_HDRHISTOGRAM WITH_HDRHISTOGRAM y
+    fi
+
+    # Use builtin lz4 if linking statically or if --disable-lz4 is used.
+    if [[ $MKL_SOURCE_DEPS_ONLY != y ]] && [[ $WITH_STATIC_LINKING != y ]] && [[ $ENABLE_LZ4_EXT == y ]]; then
+        mkl_meta_set "liblz4" "static" "liblz4.a"
+        mkl_lib_check "liblz4" "WITH_LZ4_EXT" disable CC "-llz4" \
                       "#include <lz4frame.h>"
     fi
+
+    # rapidjson (>=1.1.0) is used in tests to verify statistics data, not used
+    # by librdkafka itself.
+    mkl_compile_check "rapidjson" "WITH_RAPIDJSON" disable CXX "" \
+                      "#include <rapidjson/schema.h>"
 
     # Snappy support is built-in
     mkl_allvar_set WITH_SNAPPY WITH_SNAPPY y
@@ -78,20 +118,11 @@ void foo (void) {
     # Enable sockem (tests)
     mkl_allvar_set WITH_SOCKEM WITH_SOCKEM y
 
-    if [[ "$ENABLE_SSL" == "y" ]]; then
-	mkl_meta_set "libssl" "deb" "libssl-dev"
-        if [[ $MKL_DISTRO == "osx" ]]; then
-            # Add brew's OpenSSL pkg-config path on OSX
-            export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:/usr/local/opt/openssl/lib/pkgconfig"
-        fi
-	mkl_lib_check "libssl" "WITH_SSL" disable CC "-lssl" \
-                      "#include <openssl/ssl.h>"
-    fi
-
     if [[ "$ENABLE_SASL" == "y" ]]; then
         mkl_meta_set "libsasl2" "deb" "libsasl2-dev"
+        mkl_meta_set "libsasl2" "rpm" "cyrus-sasl"
         if ! mkl_lib_check "libsasl2" "WITH_SASL_CYRUS" disable CC "-lsasl2" "#include <sasl/sasl.h>" ; then
-	    mkl_lib_check "libsasl" "WITH_SASL_CYRUS" disable CC "-lsasl" \
+            mkl_lib_check "libsasl" "WITH_SASL_CYRUS" disable CC "-lsasl" \
                           "#include <sasl/sasl.h>"
         fi
     fi
@@ -99,6 +130,9 @@ void foo (void) {
     if [[ "$WITH_SSL" == "y" ]]; then
         # SASL SCRAM requires base64 encoding from OpenSSL
         mkl_allvar_set WITH_SASL_SCRAM WITH_SASL_SCRAM y
+        # SASL OAUTHBEARER's default unsecured JWS implementation
+        # requires base64 encoding from OpenSSL
+        mkl_allvar_set WITH_SASL_OAUTHBEARER WITH_SASL_OAUTHBEARER y
     fi
 
     # CRC32C: check for crc32 instruction support.
@@ -149,7 +183,7 @@ void foo (void) {
     mkl_mkvar_append CXXFLAGS CXXFLAGS "-Wno-non-virtual-dtor"
 
     # Required on SunOS
-    if [[ $MKL_DISTRO == "SunOS" ]]; then
+    if [[ $MKL_DISTRO == "sunos" ]]; then
 	mkl_mkvar_append CPPFLAGS CPPFLAGS "-D_POSIX_PTHREAD_SEMANTICS -D_REENTRANT -D__EXTENSIONS__"
 	# Source defines _POSIX_C_SOURCE to 200809L for Solaris, and this is
 	# incompatible on that platform with compilers < c99.
@@ -183,13 +217,21 @@ const char *foo (void) {
 void foo (void) {
   pthread_setname_np(pthread_self(), "abc");
 }
+' || \
+    mkl_compile_check "pthread_setname_darwin" "HAVE_PTHREAD_SETNAME_DARWIN" disable CC "-D_DARWIN_C_SOURCE -lpthread" \
+'
+#include <pthread.h>
+
+void foo (void) {
+  pthread_setname_np("abc");
+}
 '
 
     # Figure out what tool to use for dumping public symbols.
     # We rely on configure.cc setting up $NM if it exists.
     if mkl_env_check "nm" "" cont "NM" ; then
 	# nm by future mk var
-	if [[ $MKL_DISTRO == "osx" || $MKL_DISTRO == "AIX" ]]; then
+	if [[ $MKL_DISTRO == "osx" || $MKL_DISTRO == "aix" ]]; then
 	    mkl_mkvar_set SYMDUMPER SYMDUMPER '$(NM) -g'
 	else
 	    mkl_mkvar_set SYMDUMPER SYMDUMPER '$(NM) -D'

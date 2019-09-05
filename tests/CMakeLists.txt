@@ -72,23 +72,38 @@ set(
     0077-compaction.c
     0078-c_from_cpp.cpp
     0079-fork.c
-    0081-fetch_max_bytes.cpp
+    0080-admin_ut.c
+    0081-admin.c
+    0082-fetch_max_bytes.cpp
+    0083-cb_event.c
+    0084-destroy_flags.c
+    0085-headers.cpp
+    0086-purge.c
+    0088-produce_metadata_timeout.c
+    0089-max_poll_interval.c
+    0090-idempotence.c
+    0091-max_poll_interval_timeout.c
+    0092-mixed_msgver.c
+    0093-holb.c
+    0094-idempotence_msg_timeout.c
+    0095-all_brokers_down.cpp
+    0097-ssl_verify.cpp
+    0098-consumer-txn.cpp
+    0099-commit_metadata.c
+    0100-thread_interceptors.cpp
     8000-idle.cpp
     test.c
-    testcpp.cpp    
+    testcpp.cpp
 )
 
 if(NOT WIN32)
-    list(APPEND sources sockem.c)
+    list(APPEND sources sockem.c sockem_ctrl.c)
 else()
-    list(APPEND sources ../src/tinycthread.c)
+    list(APPEND sources ../src/tinycthread.c ../src/tinycthread_extra.c)
 endif()
 
 add_executable(rdkafka_test ${sources})
 target_link_libraries(rdkafka_test PUBLIC rdkafka++)
-if(WIN32)
-    target_compile_definitions(rdkafka_test PRIVATE LIBRDKAFKACPP_EXPORTS=0)
-endif(WIN32)
 
 add_test(NAME RdKafkaTestInParallel COMMAND rdkafka_test -p5)
 add_test(NAME RdKafkaTestSequentially COMMAND rdkafka_test -p1)

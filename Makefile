@@ -10,6 +10,10 @@ VERSION?=	$(shell python packaging/get_version.py src/rdkafka.h)
 # Jenkins CI integration
 BUILD_NUMBER ?= 1
 
+# Skip copyright check in the following paths
+MKL_COPYRIGHT_SKIP?=^(tests|packaging)
+
+
 .PHONY:
 
 all: mklove-check libs CONFIGURATION.md check
@@ -21,8 +25,10 @@ libs:
 
 CONFIGURATION.md: src/rdkafka.h examples
 	@printf "$(MKL_YELLOW)Updating$(MKL_CLR_RESET)\n"
-	@echo '//@file' > CONFIGURATION.md.tmp
-	@(examples/rdkafka_performance -X list >> CONFIGURATION.md.tmp; \
+	@echo "# Configuration properties" > CONFIGURATION.md.tmp
+	@(examples/rdkafka_performance -X list | \
+		sed 's/||/\\|\\|/g' >> \
+		CONFIGURATION.md.tmp; \
 		cmp CONFIGURATION.md CONFIGURATION.md.tmp || \
 		mv CONFIGURATION.md.tmp CONFIGURATION.md; \
 		rm -f CONFIGURATION.md.tmp)
@@ -31,7 +37,7 @@ file-check: CONFIGURATION.md LICENSES.txt examples
 check: file-check
 	@(for d in $(LIBSUBDIRS); do $(MAKE) -C $$d $@ || exit $?; done)
 
-install:
+install uninstall:
 	@(for d in $(LIBSUBDIRS); do $(MAKE) -C $$d $@ || exit $?; done)
 
 examples tests: .PHONY libs
@@ -49,7 +55,7 @@ clean:
 	@$(MAKE) -C examples $@
 	@(for d in $(LIBSUBDIRS); do $(MAKE) -C $$d $@ ; done)
 
-distclean: clean
+distclean: clean deps-clean
 	./configure --clean
 	rm -f config.log config.log.old
 

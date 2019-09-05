@@ -54,6 +54,9 @@
  */
 
 #include "rd.h"
+#include "rdunittest.h"
+#include "rdavl.h"
+#include "rdlist.h"
 #include "rdkafka_int.h"
 #include "rdkafka_msg.h"
 #include "rdkafka_msgset.h"
@@ -71,7 +74,17 @@
 #if WITH_SNAPPY
 #include "snappy.h"
 #endif
+#if WITH_ZSTD
+#include "rdkafka_zstd.h"
+#endif
 
+
+static RD_INLINE int64_t
+rd_kafka_aborted_txns_pop_offset (rd_kafka_aborted_txns_t *aborted_txns,
+                                  int64_t pid);
+static RD_INLINE int64_t
+rd_kafka_aborted_txns_get_offset (const rd_kafka_aborted_txns_t *aborted_txns,
+                                  int64_t pid);
 
 
 struct msgset_v2_hdr {
@@ -91,6 +104,20 @@ struct msgset_v2_hdr {
 };
 
 
+/**
+ * @struct rd_kafka_aborted_txn_start_offsets_t
+ *
+ * @brief A sorted list of aborted transaction start offsets
+ * (ascending) for a PID, and an offset into that list.
+ */
+typedef struct rd_kafka_aborted_txn_start_offsets_s {
+        rd_avl_node_t avl_node;
+        int64_t pid;
+        int offsets_idx;
+        rd_list_t offsets;
+} rd_kafka_aborted_txn_start_offsets_t;
+
+
 typedef struct rd_kafka_msgset_reader_s {
         rd_kafka_buf_t *msetr_rkbuf;     /**< Response read buffer */
 
@@ -108,6 +135,33 @@ typedef struct rd_kafka_msgset_reader_s {
 
         struct msgset_v2_hdr   *msetr_v2_hdr;    /**< MessageSet v2 header */
 
+        /*
+         * Aborted Transaction Start Offsets. These are arranged in a map
+         * (ABORTED_TXN_OFFSETS), with PID as the key and value as follows:
+         *  - OFFSETS:  sorted list of aborted transaction start offsets (ascending)
+         *  - IDX:      an index into OFFSETS list, initialized to 0.
+         *
+         * The logic for processing fetched data is as follows (note: this is
+         * different from the Java client):
+         *
+         * 1. If the message is a transaction control message and the status is ABORT
+         *   then increment ABORTED_TXN_OFFSETS(PID).IDX. note: sanity check that
+         *   OFFSETS[ABORTED_TXN_OFFSETS(PID).IDX] is less than the current offset
+         *   before incrementing. If the status is COMMIT, do nothing.
+         *
+         * 2. If the message is a normal message, find the corresponding OFFSETS list
+         *   in ABORTED_TXN_OFFSETS. If it doesn't exist, then keep the message. If
+         *   the PID does exist, compare ABORTED_TXN_OFFSETS(PID).IDX with
+         *   len(OFFSETS). If it's >= then the message should be kept. If not,
+         *   compare the message offset with OFFSETS[ABORTED_TXN_OFFSETS(PID).IDX].
+         *   If it's greater than or equal to this value, then the message should be
+         *   ignored. If it's less than, then the message should be kept.
+         *
+         * Note: A MessageSet comprises messages from at most one transaction, so the
+         * logic in step 2 is done at the message set level.
+         */
+        rd_kafka_aborted_txns_t *msetr_aborted_txns;
+
         const struct rd_kafka_toppar_ver *msetr_tver; /**< Toppar op version of
                                                        *   request. */
 
@@ -117,6 +171,7 @@ typedef struct rd_kafka_msgset_reader_s {
                                           *          reference! */
 
         int          msetr_msgcnt;      /**< Number of messages in rkq */
+        int64_t      msetr_msg_bytes;   /**< Number of bytes in rkq */
         rd_kafka_q_t msetr_rkq;         /**< Temp Message and error queue */
         rd_kafka_q_t *msetr_par_rkq;    /**< Parent message and error queue,
                                          *   the temp msetr_rkq will be moved
@@ -131,6 +186,9 @@ typedef struct rd_kafka_msgset_reader_s {
                                          *   can't be relied on for next
                                          *   fetch offset, such as with
                                          *   compacted topics. */
+
+        int msetr_ctrl_cnt;             /**< Number of control messages
+                                         *   or MessageSets received. */
 
         const char *msetr_srcname;      /**< Optional message source string,
                                          *   used in debug logging to
@@ -158,12 +216,14 @@ rd_kafka_msgset_reader_init (rd_kafka_msgset_reader_t *msetr,
                              rd_kafka_buf_t *rkbuf,
                              rd_kafka_toppar_t *rktp,
                              const struct rd_kafka_toppar_ver *tver,
+                             rd_kafka_aborted_txns_t *aborted_txns,
                              rd_kafka_q_t *par_rkq) {
 
         memset(msetr, 0, sizeof(*msetr));
 
         msetr->msetr_rkb        = rkbuf->rkbuf_rkb;
         msetr->msetr_rktp       = rktp;
+        msetr->msetr_aborted_txns = aborted_txns;
         msetr->msetr_tver       = tver;
         msetr->msetr_rkbuf      = rkbuf;
         msetr->msetr_srcname    = "";
@@ -342,6 +402,19 @@ rd_kafka_msgset_reader_decompress (rd_kafka_msgset_reader_t *msetr,
         }
         break;
 
+#if WITH_ZSTD
+        case RD_KAFKA_COMPRESSION_ZSTD:
+        {
+                err = rd_kafka_zstd_decompress(msetr->msetr_rkb,
+                                              (char *)compressed,
+                                              compressed_size,
+                                              &iov.iov_base, &iov.iov_len);
+                if (err)
+                        goto err;
+        }
+        break;
+#endif
+
         default:
                 rd_rkb_dbg(msetr->msetr_rkb, MSG, "CODEC",
                            "%s [%"PRId32"]: Message at offset %"PRId64
@@ -384,6 +457,9 @@ rd_kafka_msgset_reader_decompress (rd_kafka_msgset_reader_t *msetr,
                                             rkbufz,
                                             msetr->msetr_rktp,
                                             msetr->msetr_tver,
+                                            /* there is no aborted transaction
+                                             * support for MsgVersion < 2 */
+                                            NULL,
                                             &msetr->msetr_rkq);
 
                 inner_msetr.msetr_srcname = "compressed ";
@@ -408,6 +484,7 @@ rd_kafka_msgset_reader_decompress (rd_kafka_msgset_reader_t *msetr,
 
                 /* Transfer message count from inner to outer */
                 msetr->msetr_msgcnt += inner_msetr.msetr_msgcnt;
+                msetr->msetr_msg_bytes += inner_msetr.msetr_msg_bytes;
 
 
         } else {
@@ -615,6 +692,7 @@ rd_kafka_msgset_reader_msg_v0_1 (rd_kafka_msgset_reader_t *msetr) {
         /* Enqueue message on temporary queue */
         rd_kafka_q_enq(&msetr->msetr_rkq, rko);
         msetr->msetr_msgcnt++;
+        msetr->msetr_msg_bytes += rkm->rkm_key_len + rkm->rkm_len;
 
         return RD_KAFKA_RESP_ERR_NO_ERROR; /* Continue */
 
@@ -671,8 +749,122 @@ rd_kafka_msgset_reader_msg_v2 (rd_kafka_msgset_reader_t *msetr) {
                 return RD_KAFKA_RESP_ERR_NO_ERROR; /* Continue with next msg */
         }
 
-        rd_kafka_buf_read_bytes_varint(rkbuf, &hdr.Key);
+        /* Handle control messages */
+        if (msetr->msetr_v2_hdr->Attributes & RD_KAFKA_MSGSET_V2_ATTR_CONTROL) {
+                struct {
+                        int64_t KeySize;
+                        int16_t Version;
+                        int16_t Type;
+                } ctrl_data;
+                int64_t aborted_txn_start_offset;
 
+                rd_kafka_buf_read_varint(rkbuf, &ctrl_data.KeySize);
+
+                if (unlikely(ctrl_data.KeySize < 2))
+                        rd_kafka_buf_parse_fail(rkbuf,
+                                "%s [%"PRId32"]: "
+                                "Ctrl message at offset %"PRId64
+                                " has invalid key size %"PRId64,
+                                rktp->rktp_rkt->rkt_topic->str,
+                                rktp->rktp_partition,
+                                hdr.Offset, ctrl_data.KeySize);
+
+                rd_kafka_buf_read_i16(rkbuf, &ctrl_data.Version);
+
+                if (ctrl_data.Version != 0) {
+                        rd_rkb_dbg(msetr->msetr_rkb, MSG, "MSG",
+                                "%s [%"PRId32"]: "
+                                "Skipping ctrl msg with "
+                                "unsupported version %"PRId16
+                                " at offset %"PRId64,
+                                rktp->rktp_rkt->rkt_topic->str,
+                                rktp->rktp_partition,
+                                ctrl_data.Version, hdr.Offset);
+                        rd_kafka_buf_skip_to(rkbuf, message_end);
+                        return RD_KAFKA_RESP_ERR_NO_ERROR; /* Continue with next msg */
+                }
+
+                if (unlikely(ctrl_data.KeySize != 4))
+                        rd_kafka_buf_parse_fail(rkbuf,
+                                "%s [%"PRId32"]: "
+                                "Ctrl message at offset %"PRId64
+                                " has invalid key size %"PRId64,
+                                rktp->rktp_rkt->rkt_topic->str,
+                                rktp->rktp_partition,
+                                hdr.Offset, ctrl_data.KeySize);
+
+                rd_kafka_buf_read_i16(rkbuf, &ctrl_data.Type);
+
+                /* Client is uninterested in value of commit marker */
+                rd_kafka_buf_skip(rkbuf, (int32_t)(message_end
+                        - rd_slice_offset(&rkbuf->rkbuf_reader)));
+
+                switch (ctrl_data.Type) {
+                case RD_KAFKA_CTRL_MSG_COMMIT:
+                        /* always ignore. */
+                        break;
+
+                case RD_KAFKA_CTRL_MSG_ABORT:
+                        if (msetr->msetr_rkb->rkb_rk->rk_conf.isolation_level !=
+                                        RD_KAFKA_READ_COMMITTED)
+                                break;
+
+                        if (unlikely(!msetr->msetr_aborted_txns))
+                                goto unexpected_abort_txn;
+
+                        /* This marks the end of this (aborted) transaction,
+                         * advance to next aborted transaction in list */
+                        aborted_txn_start_offset = rd_kafka_aborted_txns_pop_offset(
+                                msetr->msetr_aborted_txns, msetr->msetr_v2_hdr->PID);
+
+                        if (unlikely(aborted_txn_start_offset == -1))
+                                goto unexpected_abort_txn;
+
+                        if (unlikely(aborted_txn_start_offset > hdr.Offset))
+                                rd_rkb_log(msetr->msetr_rkb, LOG_ERR, "TXN",
+                                        "%s [%"PRId32"]: "
+                                        "Abort txn ctrl msg bad order "
+                                        "at offset %"PRId64". Expected "
+                                        "before or at %"PRId64". Messages "
+                                        "in aborted transactions may be "
+                                        "delivered to the application",
+                                        rktp->rktp_rkt->rkt_topic->str,
+                                        rktp->rktp_partition,
+                                        hdr.Offset, aborted_txn_start_offset);
+
+                        break;
+
+unexpected_abort_txn:
+                        rd_rkb_log(msetr->msetr_rkb, LOG_WARNING, "TXN",
+                                "%s [%"PRId32"]: "
+                                "Received abort txn ctrl msg for "
+                                "unknown txn PID %"PRId64" at "
+                                "offset %"PRId64": ignoring",
+                                rktp->rktp_rkt->rkt_topic->str,
+                                rktp->rktp_partition,
+                                msetr->msetr_v2_hdr->PID, hdr.Offset);
+                        break;
+
+                default:
+                        rd_rkb_dbg(msetr->msetr_rkb, MSG, "TXN"
+                                "%s [%"PRId32"]: "
+                                "Unsupported ctrl message "
+                                "type %"PRId16" at offset"
+                                " %"PRId64": ignoring",
+                                rktp->rktp_rkt->rkt_topic->str,
+                                rktp->rktp_partition,
+                                ctrl_data.Type, hdr.Offset);
+                        break;
+                }
+
+                return RD_KAFKA_RESP_ERR_NO_ERROR;
+        }
+
+        /* Regular message */
+
+        /* Note: messages in aborted transactions are skipped at the MessageSet level */
+
+        rd_kafka_buf_read_bytes_varint(rkbuf, &hdr.Key);
         rd_kafka_buf_read_bytes_varint(rkbuf, &hdr.Value);
 
         /* We parse the Headers later, just store the size (possibly truncated)
@@ -720,6 +912,7 @@ rd_kafka_msgset_reader_msg_v2 (rd_kafka_msgset_reader_t *msetr) {
         /* Enqueue message on temporary queue */
         rd_kafka_q_enq(&msetr->msetr_rkq, rko);
         msetr->msetr_msgcnt++;
+        msetr->msetr_msg_bytes += rkm->rkm_key_len + rkm->rkm_len;
 
         return RD_KAFKA_RESP_ERR_NO_ERROR;
 
@@ -846,11 +1039,8 @@ rd_kafka_msgset_reader_v2 (rd_kafka_msgset_reader_t *msetr) {
                 goto done;
         }
 
-        /* Ignore control messages */
-        if (unlikely((hdr.Attributes & RD_KAFKA_MSGSET_V2_ATTR_CONTROL))) {
-                rd_kafka_buf_skip(rkbuf, payload_size);
-                goto done;
-        }
+        if (hdr.Attributes & RD_KAFKA_MSGSET_V2_ATTR_CONTROL)
+                msetr->msetr_ctrl_cnt++;
 
         msetr->msetr_v2_hdr = &hdr;
 
@@ -878,6 +1068,47 @@ rd_kafka_msgset_reader_v2 (rd_kafka_msgset_reader_t *msetr) {
                 if (!rd_slice_narrow_relative(&rkbuf->rkbuf_reader,
                                               &save_slice, payload_size))
                         rd_kafka_buf_check_len(rkbuf, payload_size);
+
+                if (msetr->msetr_aborted_txns == NULL &&
+                    msetr->msetr_v2_hdr->Attributes &
+                    RD_KAFKA_MSGSET_V2_ATTR_CONTROL) {
+                        /* Since there are no aborted transactions,
+                         * the MessageSet must correspond to a commit marker.
+                         * These are ignored. */
+                        rd_kafka_buf_skip(rkbuf, payload_size);
+                        rd_slice_widen(&rkbuf->rkbuf_reader, &save_slice);
+                        goto done;
+                }
+
+                if (msetr->msetr_aborted_txns != NULL &&
+                    (msetr->msetr_v2_hdr->Attributes &
+                     (RD_KAFKA_MSGSET_V2_ATTR_TRANSACTIONAL|
+                      RD_KAFKA_MSGSET_V2_ATTR_CONTROL)) ==
+                    RD_KAFKA_MSGSET_V2_ATTR_TRANSACTIONAL) {
+                        /* Transactional non-control MessageSet:
+                         * check if it is part of an aborted transaction. */
+                        int64_t txn_start_offset =
+                                rd_kafka_aborted_txns_get_offset(
+                                        msetr->msetr_aborted_txns,
+                                        msetr->msetr_v2_hdr->PID);
+
+                        if (txn_start_offset != -1 &&
+                            msetr->msetr_v2_hdr->BaseOffset >=
+                            txn_start_offset) {
+                                /* MessageSet is part of aborted transaction */
+                                rd_rkb_dbg(msetr->msetr_rkb, MSG, "MSG",
+                                           "%s [%"PRId32"]: "
+                                           "Skipping %"PRId32" message(s) "
+                                           "in aborted transaction",
+                                           rktp->rktp_rkt->rkt_topic->str,
+                                           rktp->rktp_partition,
+                                           msetr->msetr_v2_hdr->RecordCount);
+                                rd_kafka_buf_skip(rkbuf, payload_size);
+                                rd_slice_widen(&rkbuf->rkbuf_reader,
+                                               &save_slice);
+                                goto done;
+                        }
+                }
 
                 /* Read messages */
                 err = rd_kafka_msgset_reader_msgs_v2(msetr);
@@ -912,46 +1143,44 @@ rd_kafka_msgset_reader_v2 (rd_kafka_msgset_reader_t *msetr) {
 }
 
 
-
 /**
- * @brief Parse and read messages from msgset reader buffer.
+ * @brief Peek into the next MessageSet to find the MsgVersion.
+ *
+ * @param MagicBytep the MsgVersion is returned here on success.
+ *
+ * @returns an error on read underflow or if the MsgVersion is
+ *          unsupported.
  */
 static rd_kafka_resp_err_t
-rd_kafka_msgset_reader (rd_kafka_msgset_reader_t *msetr) {
+rd_kafka_msgset_reader_peek_msg_version (rd_kafka_msgset_reader_t *msetr,
+                                         int8_t *MagicBytep) {
         rd_kafka_buf_t *rkbuf = msetr->msetr_rkbuf;
         rd_kafka_toppar_t *rktp = msetr->msetr_rktp;
-        rd_kafka_resp_err_t (*reader[]) (rd_kafka_msgset_reader_t *) = {
-                /* Indexed by MsgVersion/MagicByte, pointing to
-                 * a Msg(Set)Version reader */
-                [0] = rd_kafka_msgset_reader_msg_v0_1,
-                [1] = rd_kafka_msgset_reader_msg_v0_1,
-                [2] = rd_kafka_msgset_reader_v2
-        };
-        rd_kafka_resp_err_t err;
         /* Only log decoding errors if protocol debugging enabled. */
         int log_decode_errors = (rkbuf->rkbuf_rkb->rkb_rk->rk_conf.debug &
                                  RD_KAFKA_DBG_PROTOCOL) ? LOG_DEBUG : 0;
-        int8_t MagicByte;
         size_t read_offset = rd_slice_offset(&rkbuf->rkbuf_reader);
 
-        /* We dont know the MsgVersion at this point, peek where the
-         * MagicByte resides both in MsgVersion v0..1 and v2 to
-         * know which MessageSet reader to use. */
-        rd_kafka_buf_peek_i8(rkbuf, read_offset+8+4+4, &MagicByte);
+        rd_kafka_buf_peek_i8(rkbuf, read_offset+8+4+4, MagicBytep);
 
-        if (unlikely(MagicByte < 0 || MagicByte > 2)) {
+        if (unlikely(*MagicBytep < 0 || *MagicBytep > 2)) {
                 int64_t Offset; /* For error logging */
-                rd_kafka_buf_peek_i64(rkbuf, read_offset+0, &Offset);
+                int32_t Length;
+
+                rd_kafka_buf_read_i64(rkbuf, &Offset);
 
                 rd_rkb_dbg(msetr->msetr_rkb,
                            MSG | RD_KAFKA_DBG_PROTOCOL | RD_KAFKA_DBG_FETCH,
                            "MAGICBYTE",
                            "%s [%"PRId32"]: "
                            "Unsupported Message(Set) MagicByte %d at "
-                           "offset %"PRId64": skipping",
+                           "offset %"PRId64" "
+                           "(buffer position %"PRIusz"/%"PRIusz"): skipping",
                            rktp->rktp_rkt->rkt_topic->str,
                            rktp->rktp_partition,
-                           (int)MagicByte, Offset);
+                           (int)*MagicBytep, Offset,
+                           read_offset, rd_slice_size(&rkbuf->rkbuf_reader));
+
                 if (Offset >= msetr->msetr_rktp->rktp_offsets.fetch_offset) {
                         rd_kafka_q_op_err(
                                 &msetr->msetr_rkq,
@@ -960,24 +1189,71 @@ rd_kafka_msgset_reader (rd_kafka_msgset_reader_t *msetr) {
                                 msetr->msetr_tver->version, rktp, Offset,
                                 "Unsupported Message(Set) MagicByte %d "
                                 "at offset %"PRId64,
-                                (int)MagicByte, Offset);
+                                (int)*MagicBytep, Offset);
                         /* Skip message(set) */
                         msetr->msetr_rktp->rktp_offsets.fetch_offset = Offset+1;
                 }
 
+                /* Skip this Message(Set).
+                 * If the message is malformed, the skip may trigger err_parse
+                 * and return ERR__BAD_MSG. */
+                rd_kafka_buf_read_i32(rkbuf, &Length);
+                rd_kafka_buf_skip(rkbuf, Length);
+
                 return RD_KAFKA_RESP_ERR__NOT_IMPLEMENTED;
         }
 
-        /* Let version-specific reader parse MessageSets until the slice
-         * is exhausted or an error occurs (typically a partial message). */
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+
+ err_parse:
+        return RD_KAFKA_RESP_ERR__BAD_MSG;
+}
+
+
+/**
+ * @brief Parse and read messages from msgset reader buffer.
+ */
+static rd_kafka_resp_err_t
+rd_kafka_msgset_reader (rd_kafka_msgset_reader_t *msetr) {
+        rd_kafka_buf_t *rkbuf = msetr->msetr_rkbuf;
+        rd_kafka_resp_err_t (*reader[])
+                (rd_kafka_msgset_reader_t *) = {
+                /* Indexed by MsgVersion/MagicByte, pointing to
+                 * a Msg(Set)Version reader */
+                [0] = rd_kafka_msgset_reader_msg_v0_1,
+                [1] = rd_kafka_msgset_reader_msg_v0_1,
+                [2] = rd_kafka_msgset_reader_v2
+        };
+        rd_kafka_resp_err_t err;
+
+        /* Parse MessageSets until the slice is exhausted or an
+         * error occurs (typically a partial message). */
         do {
+                int8_t MagicByte;
+
+                /* We dont know the MsgVersion at this point, peek where the
+                 * MagicByte resides both in MsgVersion v0..1 and v2 to
+                 * know which MessageSet reader to use. */
+                err = rd_kafka_msgset_reader_peek_msg_version(msetr,
+                                                              &MagicByte);
+                if (unlikely(err)) {
+                        if (err == RD_KAFKA_RESP_ERR__BAD_MSG)
+                                /* Read underflow, not an error.
+                                 * Broker may return a partial Fetch response
+                                 * due to its use of sendfile(2). */
+                                return RD_KAFKA_RESP_ERR_NO_ERROR;
+
+                        /* Continue on unsupported MsgVersions, the
+                         * MessageSet will be skipped. */
+                        continue;
+                }
+
+                /* Use MsgVersion-specific reader */
                 err = reader[(int)MagicByte](msetr);
+
         } while (!err && rd_slice_remains(&rkbuf->rkbuf_reader) > 0);
 
         return err;
-
- err_parse:
-        return RD_KAFKA_RESP_ERR_NO_ERROR;
 }
 
 
@@ -992,7 +1268,13 @@ static void rd_kafka_msgset_reader_postproc (rd_kafka_msgset_reader_t *msetr,
                                              int64_t *last_offsetp) {
         rd_kafka_op_t *rko;
 
-        if (msetr->msetr_relative_offsets) {
+        rko = rd_kafka_q_last(&msetr->msetr_rkq,
+                              RD_KAFKA_OP_FETCH,
+                              0 /* no error ops */);
+        if (rko) {
+            *last_offsetp = rko->rko_u.fetch.rkm.rkm_offset;
+
+            if (*last_offsetp != -1 && msetr->msetr_relative_offsets) {
                 /* Update messages to absolute offsets
                  * and purge any messages older than the current
                  * fetch offset. */
@@ -1000,14 +1282,9 @@ static void rd_kafka_msgset_reader_postproc (rd_kafka_msgset_reader_t *msetr,
                                        msetr->msetr_rktp->rktp_offsets.
                                        fetch_offset,
                                        msetr->msetr_outer.offset -
-                                       msetr->msetr_msgcnt + 1);
+                                       *last_offsetp);
+            }
         }
-
-        rko = rd_kafka_q_last(&msetr->msetr_rkq,
-                              RD_KAFKA_OP_FETCH,
-                              0 /* no error ops */);
-        if (rko)
-                *last_offsetp = rko->rko_u.fetch.rkm.rkm_offset;
 }
 
 
@@ -1038,8 +1315,13 @@ rd_kafka_msgset_reader_run (rd_kafka_msgset_reader_t *msetr) {
                 /* The message set didn't contain at least one full message
                  * or no error was posted on the response queue.
                  * This means the size limit perhaps was too tight,
-                 * increase it automatically. */
-                if (rktp->rktp_fetch_msg_max_bytes < (1 << 30)) {
+                 * increase it automatically.
+                 * If there was at least one control message there
+                 * is probably not a size limit and nothing is done. */
+                if (msetr->msetr_ctrl_cnt > 0) {
+                        /* Noop */
+
+                } else  if (rktp->rktp_fetch_msg_max_bytes < (1 << 30)) {
                         rktp->rktp_fetch_msg_max_bytes *= 2;
                         rd_rkb_dbg(msetr->msetr_rkb, FETCH, "CONSUME",
                                    "Topic %s [%"PRId32"]: Increasing "
@@ -1074,13 +1356,17 @@ rd_kafka_msgset_reader_run (rd_kafka_msgset_reader_t *msetr) {
         }
 
         rd_rkb_dbg(msetr->msetr_rkb, MSG | RD_KAFKA_DBG_FETCH, "CONSUME",
-                   "Enqueue %i %smessage(s) (%d ops) on %s [%"PRId32"] "
-                   "fetch queue (qlen %d, v%d, last_offset %"PRId64")",
+                   "Enqueue %i %smessage(s) (%"PRId64" bytes, %d ops) on "
+                   "%s [%"PRId32"] "
+                   "fetch queue (qlen %d, v%d, last_offset %"PRId64
+                   ", %d ctrl msgs)",
                    msetr->msetr_msgcnt, msetr->msetr_srcname,
+                   msetr->msetr_msg_bytes,
                    rd_kafka_q_len(&msetr->msetr_rkq),
                    rktp->rktp_rkt->rkt_topic->str,
                    rktp->rktp_partition, rd_kafka_q_len(&msetr->msetr_rkq),
-                   msetr->msetr_tver->version, last_offset);
+                   msetr->msetr_tver->version, last_offset,
+                   msetr->msetr_ctrl_cnt);
 
         /* Concat all messages&errors onto the parent's queue
          * (the partition's fetch queue) */
@@ -1118,20 +1404,307 @@ rd_kafka_resp_err_t
 rd_kafka_msgset_parse (rd_kafka_buf_t *rkbuf,
                        rd_kafka_buf_t *request,
                        rd_kafka_toppar_t *rktp,
+                       rd_kafka_aborted_txns_t *aborted_txns,
                        const struct rd_kafka_toppar_ver *tver) {
         rd_kafka_msgset_reader_t msetr;
         rd_kafka_resp_err_t err;
 
         rd_kafka_msgset_reader_init(&msetr, rkbuf, rktp, tver,
+                                    aborted_txns,
                                     rktp->rktp_fetchq);
 
         /* Parse and handle the message set */
         err = rd_kafka_msgset_reader_run(&msetr);
 
-        rd_atomic64_add(&rktp->rktp_c.msgs, msetr.msetr_msgcnt);
+        rd_atomic64_add(&rktp->rktp_c.rx_msgs, msetr.msetr_msgcnt);
+        rd_atomic64_add(&rktp->rktp_c.rx_msg_bytes, msetr.msetr_msg_bytes);
+
+        rd_avg_add(&rktp->rktp_rkt->rkt_avg_batchcnt,
+                   (int64_t)msetr.msetr_msgcnt);
+        rd_avg_add(&rktp->rktp_rkt->rkt_avg_batchsize,
+                   (int64_t)msetr.msetr_msg_bytes);
 
         return err;
 
 }
 
 
+/**
+ * @brief Offset comparator
+ */
+static int rd_kafka_offset_cmp (const void *_a, const void *_b) {
+        const int64_t *a = _a, *b = _b;
+        return (*a > *b) - (*a < *b);
+}
+
+
+/**
+ * @brief Pid comparator for rd_kafka_aborted_txn_start_offsets_t
+ */
+static int rd_kafka_aborted_txn_cmp_by_pid (const void *_a, const void *_b) {
+        const rd_kafka_aborted_txn_start_offsets_t *a = _a, *b = _b;
+        return (a->pid > b->pid) - (a->pid < b->pid);
+}
+
+
+/**
+ * @brief Free resources associated with an AVL tree node.
+ */
+static void rd_kafka_aborted_txn_node_destroy (void *_node_ptr) {
+        rd_kafka_aborted_txn_start_offsets_t *node_ptr = _node_ptr;
+        rd_list_destroy(&node_ptr->offsets);
+        rd_free(node_ptr);
+}
+
+
+/**
+ * @brief Allocate memory for, and initialize a new
+ * rd_kafka_aborted_txns_t struct.
+ */
+rd_kafka_aborted_txns_t *
+rd_kafka_aborted_txns_new (int32_t txn_cnt) {
+        rd_kafka_aborted_txns_t *aborted_txns;
+        aborted_txns = rd_malloc(sizeof(*aborted_txns));
+        rd_avl_init(&aborted_txns->avl, rd_kafka_aborted_txn_cmp_by_pid, 0);
+        rd_list_init(&aborted_txns->list, txn_cnt,
+                     rd_kafka_aborted_txn_node_destroy);
+        aborted_txns->cnt = txn_cnt;
+        return aborted_txns;
+}
+
+
+/**
+ * @brief Free all resources associated with a
+ * rd_kafka_aborted_txns_t struct.
+ */
+void
+rd_kafka_aborted_txns_destroy (rd_kafka_aborted_txns_t *aborted_txns) {
+        rd_list_destroy(&aborted_txns->list);
+        rd_avl_destroy(&aborted_txns->avl);
+        rd_free(aborted_txns);
+}
+
+
+/**
+ * @brief Get the abort txn start offsets corresponding to
+ * the specified pid.
+ */
+static RD_INLINE rd_kafka_aborted_txn_start_offsets_t *
+rd_kafka_aborted_txns_offsets_for_pid (rd_kafka_aborted_txns_t *aborted_txns,
+                                      int64_t pid) {
+        rd_kafka_aborted_txn_start_offsets_t node;
+        node.pid = pid;
+        return RD_AVL_FIND(&aborted_txns->avl, &node);
+}
+
+
+/**
+ * @brief Get the next aborted transaction start
+ * offset for the specified pid.
+ *
+ * @param increment_idx if true, the offset index will be incremented.
+ *
+ * @returns the start offset or -1 if there is none.
+ */
+static int64_t
+rd_kafka_aborted_txns_next_offset (rd_kafka_aborted_txns_t *aborted_txns,
+                                   int64_t pid, rd_bool_t increment_idx) {
+        int64_t abort_start_offset;
+        rd_kafka_aborted_txn_start_offsets_t *node_ptr
+                = rd_kafka_aborted_txns_offsets_for_pid(aborted_txns, pid);
+
+        if (node_ptr == NULL)
+                return -1;
+
+        if (unlikely(node_ptr->offsets_idx >= rd_list_cnt(&node_ptr->offsets)))
+                return -1;
+
+        abort_start_offset =
+                *((int64_t *)rd_list_elem(&node_ptr->offsets,
+                                          node_ptr->offsets_idx));
+
+        if (increment_idx)
+                node_ptr->offsets_idx++;
+
+        return abort_start_offset;
+}
+
+
+/**
+ * @brief Get the next aborted transaction start
+ * offset for the specified pid and progress the
+ * current index to the next one.
+ *
+ * @returns the start offset or -1 if there is none.
+ */
+static RD_INLINE int64_t
+rd_kafka_aborted_txns_pop_offset (rd_kafka_aborted_txns_t *aborted_txns,
+                                  int64_t pid) {
+        return rd_kafka_aborted_txns_next_offset(aborted_txns, pid, true);
+}
+
+
+/**
+ * @brief Get the next aborted transaction start
+ * offset for the specified pid.
+ *
+ * @returns the start offset or -1 if there is none.
+ */
+static RD_INLINE int64_t
+rd_kafka_aborted_txns_get_offset (const rd_kafka_aborted_txns_t *aborted_txns,
+                                  int64_t pid) {
+        return rd_kafka_aborted_txns_next_offset(
+                (rd_kafka_aborted_txns_t *)aborted_txns, pid, false);
+}
+
+
+/**
+ * @brief Add a transaction start offset corresponding
+ * to the specified pid to the aborted_txns collection.
+ */
+void
+rd_kafka_aborted_txns_add (rd_kafka_aborted_txns_t *aborted_txns,
+                          int64_t pid,
+                          int64_t first_offset) {
+        int64_t *v;
+        rd_kafka_aborted_txn_start_offsets_t *node_ptr
+                = rd_kafka_aborted_txns_offsets_for_pid(aborted_txns, pid);
+
+        if (!node_ptr) {
+                node_ptr = rd_malloc(sizeof(*node_ptr));
+                node_ptr->pid = pid;
+                node_ptr->offsets_idx = 0;
+                rd_list_init(&node_ptr->offsets, 0, NULL);
+                /* Each PID list has no more than AbortedTxnCnt elements */
+                rd_list_prealloc_elems(&node_ptr->offsets,
+                        sizeof(int64_t),
+                        aborted_txns->cnt, 0);
+                RD_AVL_INSERT(&aborted_txns->avl, node_ptr, avl_node);
+                rd_list_add(&aborted_txns->list, node_ptr);
+        }
+
+        v = rd_list_add(&node_ptr->offsets, NULL);
+        *v = first_offset;
+}
+
+
+/**
+ * @brief Sort each of the abort transaction start
+ * offset lists for each pid.
+ */
+void
+rd_kafka_aborted_txns_sort (rd_kafka_aborted_txns_t *aborted_txns) {
+        int k;
+        for (k = 0; k < rd_list_cnt(&aborted_txns->list); k++) {
+                rd_kafka_aborted_txn_start_offsets_t *el =
+                        rd_list_elem(&aborted_txns->list, k);
+                rd_list_sort(&el->offsets, rd_kafka_offset_cmp);
+        }
+}
+
+
+/**
+ * @brief Unit tests for all functions that operate on
+ * rd_kafka_aborted_txns_t
+ */
+int unittest_aborted_txns (void) {
+        rd_kafka_aborted_txns_t *aborted_txns = NULL;
+        int64_t start_offset;
+
+        aborted_txns = rd_kafka_aborted_txns_new(7);
+        rd_kafka_aborted_txns_add(aborted_txns, 1, 42);
+        rd_kafka_aborted_txns_add(aborted_txns, 1, 44);
+        rd_kafka_aborted_txns_add(aborted_txns, 1, 10);
+        rd_kafka_aborted_txns_add(aborted_txns, 1, 100);
+        rd_kafka_aborted_txns_add(aborted_txns, 2, 11);
+        rd_kafka_aborted_txns_add(aborted_txns, 2, 7);
+        rd_kafka_aborted_txns_add(aborted_txns, 1, 3);
+        rd_kafka_aborted_txns_sort(aborted_txns);
+
+        start_offset = rd_kafka_aborted_txns_get_offset(
+                aborted_txns, 1);
+        RD_UT_ASSERT(3 == start_offset,
+                     "queried start offset was %"PRId64", "
+                     "expected 3", start_offset);
+
+        start_offset = rd_kafka_aborted_txns_get_offset(
+                aborted_txns, 1);
+        RD_UT_ASSERT(3 == start_offset,
+                     "queried start offset was %"PRId64", "
+                     "expected 3", start_offset);
+
+        start_offset = rd_kafka_aborted_txns_pop_offset(
+                aborted_txns, 1);
+        RD_UT_ASSERT(3 == start_offset,
+                     "queried start offset was %"PRId64", "
+                     "expected 3", start_offset);
+
+        start_offset = rd_kafka_aborted_txns_get_offset(
+                aborted_txns, 1);
+        RD_UT_ASSERT(10 == start_offset,
+                     "queried start offset was %"PRId64", "
+                     "expected 10", start_offset);
+
+        start_offset = rd_kafka_aborted_txns_get_offset(
+                aborted_txns, 2);
+        RD_UT_ASSERT(7 == start_offset,
+                     "queried start offset was %"PRId64", "
+                     "expected 7", start_offset);
+
+        rd_kafka_aborted_txns_pop_offset(aborted_txns, 1);
+
+        start_offset = rd_kafka_aborted_txns_get_offset(
+                aborted_txns, 1);
+        RD_UT_ASSERT(42 == start_offset,
+                     "queried start offset was %"PRId64", "
+                     "expected 42", start_offset);
+
+        rd_kafka_aborted_txns_pop_offset(aborted_txns, 1);
+
+        start_offset = rd_kafka_aborted_txns_get_offset(
+                aborted_txns, 1);
+        RD_UT_ASSERT(44 == start_offset,
+                     "queried start offset was %"PRId64", "
+                     "expected 44", start_offset);
+
+        start_offset = rd_kafka_aborted_txns_get_offset(
+                aborted_txns, 2);
+        RD_UT_ASSERT(7 == start_offset,
+                     "queried start offset was %"PRId64", "
+                     "expected 7", start_offset);
+
+        rd_kafka_aborted_txns_pop_offset(aborted_txns, 2);
+
+        start_offset = rd_kafka_aborted_txns_get_offset(
+                aborted_txns, 2);
+        RD_UT_ASSERT(11 == start_offset,
+                     "queried start offset was %"PRId64", "
+                     "expected 11", start_offset);
+
+        /* error cases */
+        start_offset = rd_kafka_aborted_txns_get_offset(
+                aborted_txns, 3);
+        RD_UT_ASSERT(-1 == start_offset,
+                     "queried start offset was %"PRId64", "
+                     "expected -1", start_offset);
+
+        rd_kafka_aborted_txns_pop_offset(aborted_txns, 1);
+        rd_kafka_aborted_txns_pop_offset(aborted_txns, 1);
+        rd_kafka_aborted_txns_pop_offset(aborted_txns, 2);
+
+        start_offset = rd_kafka_aborted_txns_get_offset(
+                aborted_txns, 1);
+        RD_UT_ASSERT(-1 == start_offset,
+                     "queried start offset was %"PRId64", "
+                     "expected -1", start_offset);
+
+        start_offset = rd_kafka_aborted_txns_get_offset(
+                aborted_txns, 2);
+        RD_UT_ASSERT(-1 == start_offset,
+                     "queried start offset was %"PRId64", "
+                     "expected -1", start_offset);
+
+        rd_kafka_aborted_txns_destroy(aborted_txns);
+
+        RD_UT_PASS();
+}

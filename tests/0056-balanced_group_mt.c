@@ -199,11 +199,12 @@ int main_0056_balanced_group_mt (int argc, char **argv) {
         const char *topic = test_mk_topic_name(__FUNCTION__, 1);
         rd_kafka_t *rk_p, *rk_c;
         rd_kafka_topic_t *rkt_p;
-        int msg_cnt = 1000;
+        int msg_cnt = test_quick ? 100 : 1000;
         int msg_base = 0;
         int partition_cnt = 2;
         int partition;
         uint64_t testid;
+        rd_kafka_conf_t *conf;
         rd_kafka_topic_conf_t *default_topic_conf;
         rd_kafka_topic_partition_list_t *sub, *topics;
         rd_kafka_resp_err_t err;
@@ -230,8 +231,10 @@ int main_0056_balanced_group_mt (int argc, char **argv) {
         if (mtx_init(&lock, mtx_plain) != thrd_success)
                 TEST_FAIL("Cannot create mutex.");
 
-        test_conf_init(NULL, &default_topic_conf,
+        test_conf_init(&conf, &default_topic_conf,
                        (test_session_timeout_ms * 3) / 1000);
+
+        test_conf_set(conf, "enable.partition.eof", "true");
 
         test_topic_conf_set(default_topic_conf, "auto.offset.reset",
                             "smallest");
@@ -242,8 +245,8 @@ int main_0056_balanced_group_mt (int argc, char **argv) {
 
         /* Create consumers and start subscription */
         rk_c = test_create_consumer(
-                topic /*group_id*/, rebalance_cb, NULL,
-                default_topic_conf);
+                topic /*group_id*/, rebalance_cb,
+                conf, default_topic_conf);
 
         test_consumer_subscribe(rk_c, topic);
 
@@ -256,8 +259,9 @@ int main_0056_balanced_group_mt (int argc, char **argv) {
 
         TIMING_START(&t_consume, "CONSUME.WAIT");
         for (i = 0; i < MAX_THRD_CNT; ++i) {
+                int res;
                 if (tids[i] != 0)
-                        thrd_join(tids[i], NULL);
+                        thrd_join(tids[i], &res);
         }
         TIMING_STOP(&t_consume);
 

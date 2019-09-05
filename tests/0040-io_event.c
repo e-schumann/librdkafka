@@ -56,7 +56,7 @@ int main_0040_io_event (int argc, char **argv) {
 	rd_kafka_topic_t *rkt_p;
 	rd_kafka_queue_t *queue;
 	uint64_t testid;
-	int msgcnt = 100;
+        int msgcnt = test_quick ? 10 : 100;
 	int recvd = 0;
 	int fds[2];
 	int wait_multiplier = 1;
@@ -78,7 +78,7 @@ int main_0040_io_event (int argc, char **argv) {
 
 	rk_p = test_create_producer();
 	rkt_p = test_create_producer_topic(rk_p, topic, NULL);
-	err = test_auto_create_topic_rkt(rk_p, rkt_p);
+	err = test_auto_create_topic_rkt(rk_p, rkt_p, tmout_multip(5000));
         TEST_ASSERT(!err, "Topic auto creation failed: %s",
                     rd_kafka_err2str(err));
 
@@ -87,7 +87,7 @@ int main_0040_io_event (int argc, char **argv) {
 	test_conf_set(conf, "session.timeout.ms", "6000");
 	test_conf_set(conf, "enable.partition.eof", "false");
 	/* Speed up propagation of new topics */
-	test_conf_set(conf, "metadata.max.age.ms", "5000");
+	test_conf_set(conf, "metadata.max.age.ms", "1000");
 	test_topic_conf_set(tconf, "auto.offset.reset", "earliest");
 	rk_c = test_create_consumer(topic, NULL, conf, tconf);
 

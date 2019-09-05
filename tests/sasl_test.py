@@ -42,7 +42,7 @@ def test_it (version, deploy=True, conf={}, rdkconf={}, tests=None, debug=False)
     rdkafka.start()
     print('# librdkafka regression tests started, logs in %s' % rdkafka.root_path())
     try:
-        rdkafka.wait_stopped(timeout=60*10)
+        rdkafka.wait_stopped(timeout=60*30)
         rdkafka.dbg('wait stopped: %s, runtime %ds' % (rdkafka.state, rdkafka.runtime()))
     except KeyboardInterrupt:
         print('# Aborted by user')
@@ -125,9 +125,10 @@ if __name__ == '__main__':
     versions = list()
     if len(args.versions):
         for v in args.versions:
-            versions.append((v, ['SCRAM-SHA-512','PLAIN','GSSAPI']))
+            versions.append((v, ['SCRAM-SHA-512','PLAIN','GSSAPI','OAUTHBEARER']))
     else:
-        versions = [('0.10.2.0', ['SCRAM-SHA-512','PLAIN','GSSAPI']),
+        versions = [('2.1.0', ['OAUTHBEARER','GSSAPI']),
+                    ('0.10.2.0', ['SCRAM-SHA-512','PLAIN','GSSAPI']),
                     ('0.9.0.1', ['GSSAPI']),
                     ('0.8.2.2', [])]
     sasl_plain_conf = {'sasl_mechanisms': 'PLAIN',
@@ -137,18 +138,22 @@ if __name__ == '__main__':
     ssl_sasl_plain_conf = {'sasl_mechanisms': 'PLAIN',
                            'sasl_users': 'myuser=mypassword',
                            'security.protocol': 'SSL'}
+    sasl_oauthbearer_conf = {'sasl_mechanisms': 'OAUTHBEARER',
+                             'sasl_oauthbearer_config': 'scope=requiredScope principal=admin'}
     sasl_kerberos_conf = {'sasl_mechanisms': 'GSSAPI',
                           'sasl_servicename': 'kafka'}
     suites = [{'name': 'SASL PLAIN',
                'run': (args.sasl and args.plaintext),
                'conf': sasl_plain_conf,
+               'tests': ['0001'],
                'expect_fail': ['0.9.0.1', '0.8.2.2']},
               {'name': 'SASL SCRAM',
                'run': (args.sasl and args.plaintext),
                'conf': sasl_scram_conf,
                'expect_fail': ['0.9.0.1', '0.8.2.2']},
               {'name': 'PLAINTEXT (no SASL)',
-               'run': args.plaintext},
+               'run': args.plaintext,
+               'tests': ['0001']},
               {'name': 'SSL (no SASL)',
                'run': args.ssl,
                'conf': {'security.protocol': 'SSL'},
@@ -161,12 +166,23 @@ if __name__ == '__main__':
                'run': (args.sasl and args.plaintext),
                'conf': sasl_plain_conf,
                'rdkconf': {'sasl_users': 'wrongjoe=mypassword'},
+               'tests': ['0001'],
+               'expect_fail': ['all']},
+              {'name': 'SASL OAUTHBEARER',
+               'run': args.sasl,
+               'conf': sasl_oauthbearer_conf,
+               'tests': ['0001'],
+               'expect_fail': ['0.10.2.0', '0.9.0.1', '0.8.2.2']},
+              {'name': 'SASL OAUTHBEARER with wrong scope',
+               'run': args.sasl,
+               'conf': sasl_oauthbearer_conf,
+               'rdkconf': {'sasl_oauthbearer_config': 'scope=wrongScope'},
+               'tests': ['0001'],
                'expect_fail': ['all']},
               {'name': 'SASL Kerberos',
                'run': args.sasl,
                'conf': sasl_kerberos_conf,
                'expect_fail': ['0.8.2.2']}]
-
 
     pass_cnt = 0
     fail_cnt = 0
@@ -194,10 +210,14 @@ if __name__ == '__main__':
             if mech is not None and mech not in supported:
                 print('# Disabled SASL for broker version %s' % version)
                 _conf.pop('sasl_mechanisms', None)
-                
+
             # Run tests
             print('#### Version %s, suite %s: STARTING' % (version, suite['name']))
-            report = test_it(version, tests=tests, conf=_conf, rdkconf=_rdkconf,
+            if tests is None:
+                tests_to_run = suite.get('tests', None)
+            else:
+                tests_to_run = tests
+            report = test_it(version, tests=tests_to_run, conf=_conf, rdkconf=_rdkconf,
                              debug=args.debug)
 
             # Handle test report
@@ -205,7 +225,7 @@ if __name__ == '__main__':
             passed,reason = handle_report(report, version, suite)
             report['PASSED'] = passed
             report['REASON'] = reason
-            
+
             if passed:
                 print('\033[42m#### Version %s, suite %s: PASSED: %s\033[0m' %
                       (version, suite['name'], reason))

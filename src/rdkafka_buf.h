@@ -32,7 +32,7 @@
 #include "rdcrc32.h"
 #include "rdlist.h"
 #include "rdbuf.h"
-
+#include "rdkafka_msgbatch.h"
 
 typedef struct rd_kafka_broker_s rd_kafka_broker_t;
 
@@ -125,8 +125,8 @@ rd_tmpabuf_write0 (const char *func, int line,
 		   rd_tmpabuf_t *tab, const void *buf, size_t size) {
 	void *ptr = rd_tmpabuf_alloc0(func, line, tab, size);
 
-	if (ptr)
-		memcpy(ptr, buf, size);
+        if (likely(ptr && size))
+                memcpy(ptr, buf, size);
 
 	return ptr;
 }
@@ -301,7 +301,7 @@ rd_tmpabuf_write_str0 (const char *func, int line,
 #define rd_kafka_buf_read_i16(rkbuf,dstptr) do {                        \
                 int16_t _v;                                             \
                 rd_kafka_buf_read(rkbuf, &_v, sizeof(_v));              \
-                *(dstptr) = be16toh(_v);                                \
+                *(dstptr) = (int16_t)be16toh(_v);                       \
         } while (0)
 
 
@@ -315,13 +315,20 @@ rd_tmpabuf_write_str0 (const char *func, int line,
 
 #define rd_kafka_buf_peek_i8(rkbuf,of,dst) rd_kafka_buf_peek(rkbuf,of,dst,1)
 
+#define rd_kafka_buf_read_bool(rkbuf, dstptr) do {                      \
+                int8_t _v;                                              \
+                rd_bool_t *_dst = dstptr;                               \
+                rd_kafka_buf_read(rkbuf, &_v, 1);                       \
+                *_dst = (rd_bool_t)_v;                                  \
+        } while (0)
+
 
 /**
  * @brief Read varint and store in int64_t \p dst
  */
 #define rd_kafka_buf_read_varint(rkbuf,dst) do {                        \
                 int64_t _v;                                             \
-                size_t _r = rd_varint_dec_slice(&(rkbuf)->rkbuf_reader, &_v); \
+                size_t _r = rd_slice_read_varint(&(rkbuf)->rkbuf_reader, &_v);\
                 if (unlikely(RD_UVARINT_UNDERFLOW(_r)))                 \
                         rd_kafka_buf_underflow_fail(rkbuf, (size_t)0,   \
                                                     "varint parsing failed");\
@@ -334,7 +341,7 @@ rd_tmpabuf_write_str0 (const char *func, int line,
                 int _klen;                                              \
                 rd_kafka_buf_read_i16a(rkbuf, (kstr)->len);             \
                 _klen = RD_KAFKAP_STR_LEN(kstr);                        \
-                if (RD_KAFKAP_STR_LEN0(_klen) == 0)                     \
+                if (RD_KAFKAP_STR_IS_NULL(kstr))                        \
                         (kstr)->str = NULL;                             \
                 else if (!((kstr)->str =                                \
                            rd_slice_ensure_contig(&rkbuf->rkbuf_reader, \
@@ -406,8 +413,8 @@ rd_tmpabuf_write_str0 (const char *func, int line,
  */
 #define rd_kafka_buf_read_bytes_varint(rkbuf,kbytes) do {               \
                 int64_t _len2;                                          \
-                size_t _r = rd_varint_dec_slice(&(rkbuf)->rkbuf_reader, \
-                                                &_len2);                \
+                size_t _r = rd_slice_read_varint(&(rkbuf)->rkbuf_reader, \
+                                                 &_len2);               \
                 if (unlikely(RD_UVARINT_UNDERFLOW(_r)))                 \
                         rd_kafka_buf_underflow_fail(rkbuf, (size_t)0,   \
                                                     "varint parsing failed"); \
@@ -421,6 +428,19 @@ rd_tmpabuf_write_str0 (const char *func, int line,
                            rd_slice_ensure_contig(&(rkbuf)->rkbuf_reader, \
                                                   (size_t)_len2)))      \
                         rd_kafka_buf_check_len(rkbuf, _len2);           \
+        } while (0)
+
+
+/**
+ * @brief Read throttle_time_ms (i32) from response and pass the value
+ *        to the throttle handling code.
+ */
+#define rd_kafka_buf_read_throttle_time(rkbuf) do {                     \
+                int32_t _throttle_time_ms;                              \
+                rd_kafka_buf_read_i32(rkbuf, &_throttle_time_ms);       \
+                rd_kafka_op_throttle_time((rkbuf)->rkbuf_rkb,           \
+                                          (rkbuf)->rkbuf_rkb->rkb_rk->rk_rep, \
+                                          _throttle_time_ms);           \
         } while (0)
 
 
@@ -451,6 +471,8 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 
 	int     rkbuf_flags; /* RD_KAFKA_OP_F */
 
+        rd_kafka_prio_t rkbuf_prio; /**< Request priority */
+
         rd_buf_t rkbuf_buf;        /**< Send/Recv byte buffer */
         rd_slice_t rkbuf_reader;   /**< Buffer slice reader for rkbuf_buf */
 
@@ -464,7 +486,12 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
 	struct rd_kafkap_reqhdr rkbuf_reqhdr;   /* Request header.
                                                  * These fields are encoded
                                                  * and written to output buffer
-                                                 * on buffer finalization. */
+                                                 * on buffer finalization.
+                                                 * Note:
+                                                 * The request's
+                                                 * reqhdr is copied to the
+                                                 * response's reqhdr as a
+                                                 * convenience. */
 	struct rd_kafkap_reshdr rkbuf_reshdr;   /* Response header.
                                                  * Decoded fields are copied
                                                  * here from the buffer
@@ -536,14 +563,15 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
         int     rkbuf_rel_timeout;/* Relative timeout (ms), used for retries.
                                    * Defaults to socket.timeout.ms.
                                    * Mutually exclusive with rkbuf_abs_timeout*/
+        rd_bool_t rkbuf_force_timeout; /**< Force request timeout to be
+                                        *   remaining abs_timeout regardless
+                                        *   of socket.timeout.ms. */
 
 
         int64_t rkbuf_offset;     /* Used by OffsetCommit */
 
 	rd_list_t *rkbuf_rktp_vers;    /* Toppar + Op Version map.
 					* Used by FetchRequest. */
-
-	rd_kafka_msgq_t rkbuf_msgq;
 
         rd_kafka_resp_err_t rkbuf_err;      /* Buffer parsing error code */
 
@@ -564,7 +592,12 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
                         mtx_t *decr_lock;
 
                 } Metadata;
+                struct {
+                        rd_kafka_msgbatch_t batch; /**< MessageSet/batch */
+                } Produce;
         } rkbuf_u;
+
+#define rkbuf_batch rkbuf_u.Produce.batch
 
         const char *rkbuf_uflow_mitigation; /**< Buffer read underflow
                                              *   human readable mitigation
@@ -575,6 +608,12 @@ struct rd_kafka_buf_s { /* rd_kafka_buf_t */
                                              *   depends on request type. */
 };
 
+
+/**
+ * @returns true if buffer has been sent on wire, else 0.
+ */
+#define rd_kafka_buf_was_sent(rkbuf)                    \
+        ((rkbuf)->rkbuf_flags & RD_KAFKA_OP_F_SENT)
 
 typedef struct rd_kafka_bufq_s {
 	TAILQ_HEAD(, rd_kafka_buf_s) rkbq_bufs;
@@ -613,17 +652,28 @@ void rd_kafka_buf_calc_timeout (const rd_kafka_t *rk, rd_kafka_buf_t *rkbuf,
  *        from \p now.
  *
  * @param now Reuse current time from existing rd_clock() var, else 0.
+ * @param force If true: force request timeout to be same as remaining
+ *                       abs timeout, regardless of socket.timeout.ms.
+ *              If false: cap each request timeout to socket.timeout.ms.
  *
  * The remaining time is used as timeout for request retries.
  */
 static RD_INLINE void
-rd_kafka_buf_set_abs_timeout (rd_kafka_buf_t *rkbuf, int timeout_ms,
-                              rd_ts_t now) {
+rd_kafka_buf_set_abs_timeout0 (rd_kafka_buf_t *rkbuf, int timeout_ms,
+                               rd_ts_t now, rd_bool_t force) {
         if (!now)
                 now = rd_clock();
         rkbuf->rkbuf_rel_timeout = 0;
-        rkbuf->rkbuf_abs_timeout = now + (timeout_ms * 1000);
+        rkbuf->rkbuf_abs_timeout = now + ((rd_ts_t)timeout_ms * 1000);
+        rkbuf->rkbuf_force_timeout = force;
 }
+
+#define rd_kafka_buf_set_abs_timeout(rkbuf,timeout_ms,now) \
+        rd_kafka_buf_set_abs_timeout0(rkbuf,timeout_ms,now,rd_false)
+
+
+#define rd_kafka_buf_set_abs_timeout_force(rkbuf,timeout_ms,now) \
+        rd_kafka_buf_set_abs_timeout0(rkbuf,timeout_ms,now,rd_true)
 
 
 #define rd_kafka_buf_keep(rkbuf) rd_refcnt_add(&(rkbuf)->rkbuf_refcnt)

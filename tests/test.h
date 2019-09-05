@@ -39,6 +39,7 @@
 #include <errno.h>
 #include <assert.h>
 #include <time.h>
+#include <ctype.h>
 
 #include "rdkafka.h"
 #include "tinycthread.h"
@@ -68,20 +69,13 @@ extern double test_timeout_multiplier;
 extern int  test_session_timeout_ms; /* Group session timeout */
 extern int  test_flags;
 extern int  test_neg_flags;
+extern int  test_idempotent_producer;
 
 extern mtx_t test_mtx;
 
 #define TEST_LOCK()   mtx_lock(&test_mtx)
 #define TEST_UNLOCK() mtx_unlock(&test_mtx)
 
-
-#define _C_CLR "\033[0m"
-#define _C_RED "\033[31m"
-#define _C_GRN "\033[32m"
-#define _C_YEL "\033[33m"
-#define _C_BLU "\033[34m"
-#define _C_MAG "\033[35m"
-#define _C_CYA "\033[36m"
 
 typedef enum {
         TEST_NOT_STARTED,
@@ -103,6 +97,7 @@ struct test {
 				*   total test run status. */
 #define TEST_F_MANUAL      0x4 /**< Manual test, only started when specifically
                                 *   stated */
+#define TEST_F_SOCKEM      0x8 /**< Test requires socket emulation. */
 	int minver;          /**< Limit tests to broker version range. */
 	int maxver;
 
@@ -113,6 +108,8 @@ struct test {
 	int report_size;
 
         rd_kafka_resp_err_t exp_dr_err; /* Expected error in test_dr_cb */
+        rd_kafka_msg_status_t exp_dr_status; /**< Expected delivery status,
+                                              *   or -1 for not checking. */
         int produce_sync;    /**< test_produce_sync() call in action */
         rd_kafka_resp_err_t produce_sync_err;  /**< DR error */
 
@@ -125,6 +122,8 @@ struct test {
         FILE   *stats_fp;
 	int64_t timeout;
         test_state_t state;
+        int     failcnt;     /**< Number of failures, useful with FAIL_LATER */
+        char    failstr[512];/**< First test failure reason */
 
 #if WITH_SOCKEM
         rd_list_t sockets;
@@ -147,38 +146,23 @@ struct test {
 #define TEST_F_KNOWN_ISSUE_OSX  0
 #endif
 
+void test_fail0 (const char *file, int line, const char *function,
+                 int do_lock, int fail_now, const char *fmt, ...);
 
-#define TEST_FAIL0(file,line,do_lock,fail_now,...) do {                 \
-                int is_thrd = 0;                                        \
-		TEST_SAYL(0, "TEST FAILURE\n");				\
-		fprintf(stderr, "\033[31m### Test \"%s\" failed at %s:%i:%s(): ###\n", \
-			test_curr->name,                                \
-                        file, line,__FUNCTION__);                \
-		fprintf(stderr, __VA_ARGS__);				\
-		fprintf(stderr, "\n");					\
-                fprintf(stderr, "### Test random seed was %i ###\033[0m\n",    \
-                        test_seed);                                     \
-                if (do_lock)                                            \
-                        TEST_LOCK();                                    \
-                test_curr->state = TEST_FAILED;                         \
-                if (fail_now && test_curr->mainfunc) {                  \
-                        tests_running_cnt--;                            \
-                        is_thrd = 1;                                    \
-                }                                                       \
-                if (do_lock)                                            \
-                        TEST_UNLOCK();                                  \
-		if (!fail_now) break;					\
-                if (test_assert_on_fail || !is_thrd)                    \
-                        assert(0);                                      \
-                else                                                    \
-                        thrd_exit(0);                                   \
-	} while (0)
+#define TEST_FAIL0(file,line,do_lock,fail_now,...)   \
+        test_fail0(__FILE__, __LINE__, __FUNCTION__, \
+                   do_lock, fail_now, __VA_ARGS__)
 
 /* Whine and abort test */
 #define TEST_FAIL(...) TEST_FAIL0(__FILE__,__LINE__,1,1,__VA_ARGS__)
 
 /* Whine right away, mark the test as failed, but continue the test. */
 #define TEST_FAIL_LATER(...) TEST_FAIL0(__FILE__,__LINE__,1,0,__VA_ARGS__)
+
+/* Whine right away, maybe mark the test as failed, but continue the test. */
+#define TEST_FAIL_LATER0(LATER,...) TEST_FAIL0(__FILE__,__LINE__,1,!(LATER),__VA_ARGS__)
+
+#define TEST_FAILCNT()  (test_curr->failcnt)
 
 #define TEST_LATER_CHECK(...) do {                              \
         if (test_curr->state == TEST_FAILED)                    \
@@ -228,24 +212,48 @@ struct test {
                       }                                                 \
         } while (0)
 
+
+/* "..." is a failure reason in printf format, include as much info as needed */
+#define TEST_ASSERT_LATER(expr,...) do {                                \
+                if (!(expr)) {                                          \
+                        TEST_FAIL0(__FILE__, __LINE__, 1, 0,            \
+                                   "Test assertion failed: \"" # expr  "\": " \
+                                   __VA_ARGS__);                        \
+                }                                                       \
+        } while (0)
+
+static RD_INLINE RD_UNUSED void rtrim (char *str) {
+        size_t len = strlen(str);
+        char *s;
+
+        if (len == 0)
+                return;
+
+        s = str + len - 1;
+        while (isspace((int)*s)) {
+                *s = '\0';
+                s--;
+        }
+}
+
 /* Skip the current test. Argument is textual reason (printf format) */
-#define TEST_SKIP(...) do {		     \
-		TEST_WARN("SKIPPING TEST: " __VA_ARGS__); \
-		TEST_LOCK();			     \
-		test_curr->state = TEST_SKIPPED;     \
-		TEST_UNLOCK();			     \
-	} while (0)
+#define TEST_SKIP(...) do {                                             \
+                TEST_WARN("SKIPPING TEST: " __VA_ARGS__);               \
+                TEST_LOCK();                                            \
+                test_curr->state = TEST_SKIPPED;                        \
+                if (!*test_curr->failstr) {                             \
+                        rd_snprintf(test_curr->failstr,                 \
+                                    sizeof(test_curr->failstr), __VA_ARGS__); \
+                        rtrim(test_curr->failstr);                      \
+                }                                                       \
+                TEST_UNLOCK();                                          \
+        } while (0)
 
 
 void test_conf_init (rd_kafka_conf_t **conf, rd_kafka_topic_conf_t **topic_conf,
 		     int timeout);
 
 
-void test_wait_exit (int timeout);
-
-uint64_t test_id_generate (void);
-char *test_str_id_generate (char *dest, size_t dest_size);
-const char *test_str_id_generate_tmp (void);
 
 
 
@@ -374,6 +382,9 @@ int test_msgver_add_msg0 (const char *func, int line,
 #define TEST_MSGVER_BY_OFFSET 0x20000 /* Verify by offset (unique in partition)*/
 #define TEST_MSGVER_BY_TIMESTAMP 0x40000 /* Verify by timestamp range */
 
+#define TEST_MSGVER_SUBSET 0x100000  /* verify_compare: allow correct mv to be
+                                      * a subset of mv. */
+
 /* Only test per partition, not across all messages received on all partitions.
  * This is useful when doing incremental verifications with multiple partitions
  * and the total number of messages has not been received yet.
@@ -417,8 +428,8 @@ rd_kafka_t *test_create_handle (int mode, rd_kafka_conf_t *conf);
  * Delivery reported callback.
  * Called for each message once to signal its delivery status.
  */
-void test_dr_cb (rd_kafka_t *rk, void *payload, size_t len,
-                 rd_kafka_resp_err_t err, void *opaque, void *msg_opaque);
+void test_dr_msg_cb (rd_kafka_t *rk,
+                     const rd_kafka_message_t *rkmessage, void *opaque);
 
 rd_kafka_t *test_create_producer (void);
 rd_kafka_topic_t *test_create_producer_topic(rd_kafka_t *rk,
@@ -427,12 +438,16 @@ void test_wait_delivery (rd_kafka_t *rk, int *msgcounterp);
 void test_produce_msgs_nowait (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
                                uint64_t testid, int32_t partition,
                                int msg_base, int cnt,
-                               const char *payload, size_t size,
+                               const char *payload, size_t size, int msgrate,
                                int *msgcounterp);
 void test_produce_msgs (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
                         uint64_t testid, int32_t partition,
                         int msg_base, int cnt,
 			const char *payload, size_t size);
+void test_produce_msgs_rate (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
+                             uint64_t testid, int32_t partition,
+                             int msg_base, int cnt,
+                             const char *payload, size_t size, int msgrate);
 rd_kafka_resp_err_t test_produce_sync (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
                                        uint64_t testid, int32_t partition);
 
@@ -474,6 +489,7 @@ void test_consumer_subscribe (rd_kafka_t *rk, const char *topic);
 
 void
 test_consume_msgs_easy_mv (const char *group_id, const char *topic,
+                           int32_t partition,
                            uint64_t testid, int exp_eofcnt, int exp_msgcnt,
                            rd_kafka_topic_conf_t *tconf,
                            test_msgver_t *mv);
@@ -510,16 +526,21 @@ void test_print_partition_list (const rd_kafka_topic_partition_list_t
 				*partitions);
 
 void test_kafka_topics (const char *fmt, ...);
-void test_create_topic (const char *topicname, int partition_cnt,
-			int replication_factor);
+void test_create_topic (rd_kafka_t *use_rk,
+                        const char *topicname, int partition_cnt,
+                        int replication_factor);
 rd_kafka_resp_err_t test_auto_create_topic_rkt (rd_kafka_t *rk,
-                                                rd_kafka_topic_t *rkt);
-rd_kafka_resp_err_t test_auto_create_topic (rd_kafka_t *rk, const char *name);
+                                                rd_kafka_topic_t *rkt,
+                                                int timeout_ms);
+rd_kafka_resp_err_t test_auto_create_topic (rd_kafka_t *rk, const char *name,
+                                            int timeout_ms);
 int test_check_auto_create_topic (void);
 
-int test_get_partition_count (rd_kafka_t *rk, const char *topicname);
+void test_create_partitions (rd_kafka_t *use_rk,
+                             const char *topicname, int new_partition_cnt);
 
-int test_check_builtin (const char *feature);
+int test_get_partition_count (rd_kafka_t *rk, const char *topicname,
+                              int timeout_ms);
 
 char *tsprintf (const char *fmt, ...) RD_FORMAT(printf, 1, 2);
 
@@ -538,9 +559,57 @@ void test_prepare_msg (uint64_t testid, int32_t partition, int msg_id,
 void test_socket_enable (rd_kafka_conf_t *conf);
 void test_socket_close_all (struct test *test, int reinit);
 int  test_socket_sockem_set_all (const char *key, int val);
+void test_socket_sockem_set (int s, const char *key, int value);
 #endif
 
 void test_headers_dump (const char *what, int lvl,
                         const rd_kafka_headers_t *hdrs);
+
+int32_t *test_get_broker_ids (rd_kafka_t *use_rk, size_t *cntp);
+
+void test_wait_metadata_update (rd_kafka_t *rk,
+                                rd_kafka_metadata_topic_t *topics,
+                                size_t topic_cnt,
+                                rd_kafka_metadata_topic_t *not_topics,
+                                size_t not_topic_cnt,
+                                int tmout);
+
+rd_kafka_event_t *
+test_wait_admin_result (rd_kafka_queue_t *q,
+                        rd_kafka_event_type_t evtype,
+                        int tmout);
+
+rd_kafka_resp_err_t
+test_wait_topic_admin_result (rd_kafka_queue_t *q,
+                              rd_kafka_event_type_t evtype,
+                              rd_kafka_event_t **retevent,
+                              int tmout);
+
+rd_kafka_resp_err_t
+test_CreateTopics_simple (rd_kafka_t *rk,
+                          rd_kafka_queue_t *useq,
+                          char **topics, size_t topic_cnt,
+                          int num_partitions,
+                          void *opaque);
+rd_kafka_resp_err_t
+test_CreatePartitions_simple (rd_kafka_t *rk,
+                              rd_kafka_queue_t *useq,
+                              const char *topic,
+                              size_t total_part_cnt,
+                              void *opaque);
+
+rd_kafka_resp_err_t
+test_DeleteTopics_simple (rd_kafka_t *rk,
+                          rd_kafka_queue_t *useq,
+                          char **topics, size_t topic_cnt,
+                          void *opaque);
+
+rd_kafka_resp_err_t
+test_AlterConfigs_simple (rd_kafka_t *rk,
+                          rd_kafka_ResourceType_t restype,
+                          const char *resname,
+                          const char **configs, size_t config_cnt);
+
+rd_kafka_resp_err_t test_delete_all_test_topics (int timeout_ms);
 
 #endif /* _TEST_H_ */

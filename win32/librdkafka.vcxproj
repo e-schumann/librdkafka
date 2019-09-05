@@ -69,6 +69,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
+      <AdditionalOptions>/SAFESEH:NO</AdditionalOptions>
       <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies);libeay32MT.lib;ssleay32MT.lib</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
@@ -98,12 +99,15 @@
     <ClInclude Include="..\src\rdavg.h" />
     <ClInclude Include="..\src\rdbuf.h" />
     <ClInclude Include="..\src\rdendian.h" />
+    <ClInclude Include="..\src\rdfloat.h" />
     <ClInclude Include="..\src\rdgz.h" />
     <ClInclude Include="..\src\rdinterval.h" />
+    <ClInclude Include="..\src\rdkafka_admin.h" />
     <ClInclude Include="..\src\rdkafka_assignor.h" />
     <ClInclude Include="..\src\rdkafka_buf.h" />
     <ClInclude Include="..\src\rdkafka_cgrp.h" />
     <ClInclude Include="..\src\rdkafka_conf.h" />
+    <ClInclude Include="..\src\rdkafka_confval.h" />
     <ClInclude Include="..\src\rdkafka_event.h" />
     <ClInclude Include="..\src\rdkafka_feature.h" />
     <ClInclude Include="..\src\rdkafka_lz4.h" />
@@ -130,6 +134,8 @@
     <ClInclude Include="..\src\rdkafka_timer.h" />
     <ClInclude Include="..\src\rdkafka_topic.h" />
     <ClInclude Include="..\src\rdkafka_transport.h" />
+    <ClInclude Include="..\src\rdkafka_ssl.h" />
+    <ClInclude Include="..\src\rdkafka_cert.h" />
     <ClInclude Include="..\src\rdkafka_metadata.h" />
     <ClInclude Include="..\src\rdkafka_interceptor.h" />
     <ClInclude Include="..\src\rdkafka_plugin.h" />
@@ -146,6 +152,7 @@
     <ClInclude Include="..\src\snappy.h" />
     <ClInclude Include="..\src\snappy_compat.h" />
     <ClInclude Include="..\src\tinycthread.h" />
+    <ClInclude Include="..\src\tinycthread_extra.h" />
     <ClInclude Include="..\src\rdwin32.h" />
     <ClInclude Include="..\src\win32_config.h" />
     <ClInclude Include="..\src\regexp.h" />
@@ -159,6 +166,7 @@
     <ClCompile Include="..\src\rdbuf.c" />
     <ClCompile Include="..\src\rdcrc32.c" />
     <ClCompile Include="..\src\rdgz.c" />
+    <ClCompile Include="..\src\rdhdrhistogram.c" />
     <ClCompile Include="..\src\rdkafka.c" />
     <ClCompile Include="..\src\rdkafka_assignor.c" />
     <ClCompile Include="..\src\rdkafka_broker.c" />
@@ -181,10 +189,13 @@
     <ClCompile Include="..\src\rdkafka_sasl_win32.c" />
     <ClCompile Include="..\src\rdkafka_sasl_plain.c" />
     <ClCompile Include="..\src\rdkafka_sasl_scram.c" />
+    <ClCompile Include="..\src\rdkafka_sasl_oauthbearer.c" />
     <ClCompile Include="..\src\rdkafka_subscription.c" />
     <ClCompile Include="..\src\rdkafka_timer.c" />
     <ClCompile Include="..\src\rdkafka_topic.c" />
     <ClCompile Include="..\src\rdkafka_transport.c" />
+    <ClCompile Include="..\src\rdkafka_ssl.c" />
+    <ClCompile Include="..\src\rdkafka_cert.c" />
     <ClCompile Include="..\src\rdkafka_buf.c" />
     <ClCompile Include="..\src\rdkafka_feature.c" />
     <ClCompile Include="..\src\rdkafka_metadata.c" />
@@ -192,6 +203,11 @@
     <ClCompile Include="..\src\rdkafka_interceptor.c" />
     <ClCompile Include="..\src\rdkafka_plugin.c" />
     <ClCompile Include="..\src\rdkafka_header.c" />
+    <ClCompile Include="..\src\rdkafka_admin.c" />
+    <ClCompile Include="..\src\rdkafka_aux.c" />
+    <ClCompile Include="..\src\rdkafka_background.c" />
+    <ClCompile Include="..\src\rdkafka_idempotence.c" />
+    <ClCompile Include="..\src\rdkafka_zstd.c" />
     <ClCompile Include="..\src\rdlist.c" />
     <ClCompile Include="..\src\rdlog.c" />
     <ClCompile Include="..\src\rdmurmur2.c" />
@@ -202,6 +218,7 @@
     <ClCompile Include="..\src\rdvarint.c" />
     <ClCompile Include="..\src\snappy.c" />
     <ClCompile Include="..\src\tinycthread.c" />
+    <ClCompile Include="..\src\tinycthread_extra.c" />
     <ClCompile Include="..\src\regexp.c" />
     <ClCompile Include="..\src\rdports.c" />
     <ClCompile Include="..\src\rdavl.c" />
@@ -221,11 +238,13 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
     <Import Project="packages\zlib.$(PlatformToolset).windesktop.msvcstl.dyn.rt-dyn.1.2.8.8\build\native\zlib.$(PlatformToolset).windesktop.msvcstl.dyn.rt-dyn.targets" Condition="Exists('packages\zlib.$(PlatformToolset).windesktop.msvcstl.dyn.rt-dyn.1.2.8.8\build\native\zlib.$(PlatformToolset).windesktop.msvcstl.dyn.rt-dyn.targets')" />
+    <Import Project="packages\confluent.libzstd.redist.1.3.8-g9f9630f4-test1\build\native\confluent.libzstd.redist.targets" Condition="Exists('packages\confluent.libzstd.redist.1.3.8-g9f9630f4-test1\build\native\confluent.libzstd.redist.targets')" />
   </ImportGroup>
   <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">
     <PropertyGroup>
       <ErrorText>This project references NuGet package(s) that are missing on this computer. Enable NuGet Package Restore to download them.  For more information, see http://go.microsoft.com/fwlink/?LinkID=322105. The missing file is {0}.</ErrorText>
     </PropertyGroup>
     <Error Condition="!Exists('packages\zlib.$(PlatformToolset).windesktop.msvcstl.dyn.rt-dyn.1.2.8.8\build\native\zlib.$(PlatformToolset).windesktop.msvcstl.dyn.rt-dyn.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\zlib.$(PlatformToolset).windesktop.msvcstl.dyn.rt-dyn.1.2.8.8\build\native\zlib.$(PlatformToolset).windesktop.msvcstl.dyn.rt-dyn.targets'))" />
+    <Error Condition="!Exists('packages\confluent.libzstd.redist.1.3.8-g9f9630f4-test1\build\native\confluent.libzstd.redist.targets')" Text="$([System.String]::Format('$(ErrorText)', 'packages\confluent.libzstd.redist.1.3.8-g9f9630f4-test1\build\native\confluent.libzstd.redist.targets'))" />
   </Target>
 </Project>

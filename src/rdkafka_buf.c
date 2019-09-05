@@ -51,6 +51,10 @@ void rd_kafka_buf_destroy_final (rd_kafka_buf_t *rkbuf) {
                         mtx_unlock(rkbuf->rkbuf_u.Metadata.decr_lock);
                 }
                 break;
+
+        case RD_KAFKAP_Produce:
+                rd_kafka_msgbatch_destroy(&rkbuf->rkbuf_batch);
+                break;
         }
 
         if (rkbuf->rkbuf_response)
@@ -105,7 +109,6 @@ rd_kafka_buf_t *rd_kafka_buf_new0 (int segcnt, size_t size, int flags) {
         rkbuf->rkbuf_flags = flags;
 
         rd_buf_init(&rkbuf->rkbuf_buf, segcnt, size);
-        rd_kafka_msgq_init(&rkbuf->rkbuf_msgq);
         rd_refcnt_init(&rkbuf->rkbuf_refcnt, 1);
 
         return rkbuf;
@@ -176,8 +179,6 @@ rd_kafka_buf_t *rd_kafka_buf_new_shadow (const void *ptr, size_t size,
         /* Initialize reader slice */
         rd_slice_init_full(&rkbuf->rkbuf_reader, &rkbuf->rkbuf_buf);
 
-	rd_kafka_msgq_init(&rkbuf->rkbuf_msgq);
-
         rd_refcnt_init(&rkbuf->rkbuf_refcnt, 1);
 
 	return rkbuf;
@@ -187,17 +188,19 @@ rd_kafka_buf_t *rd_kafka_buf_new_shadow (const void *ptr, size_t size,
 
 void rd_kafka_bufq_enq (rd_kafka_bufq_t *rkbufq, rd_kafka_buf_t *rkbuf) {
 	TAILQ_INSERT_TAIL(&rkbufq->rkbq_bufs, rkbuf, rkbuf_link);
-	(void)rd_atomic32_add(&rkbufq->rkbq_cnt, 1);
-        (void)rd_atomic32_add(&rkbufq->rkbq_msg_cnt,
-                              rkbuf->rkbuf_msgq.rkmq_msg_cnt);
+        rd_atomic32_add(&rkbufq->rkbq_cnt, 1);
+        if (rkbuf->rkbuf_reqhdr.ApiKey == RD_KAFKAP_Produce)
+                rd_atomic32_add(&rkbufq->rkbq_msg_cnt,
+                                rd_kafka_msgq_len(&rkbuf->rkbuf_batch.msgq));
 }
 
 void rd_kafka_bufq_deq (rd_kafka_bufq_t *rkbufq, rd_kafka_buf_t *rkbuf) {
 	TAILQ_REMOVE(&rkbufq->rkbq_bufs, rkbuf, rkbuf_link);
 	rd_kafka_assert(NULL, rd_atomic32_get(&rkbufq->rkbq_cnt) > 0);
-	(void)rd_atomic32_sub(&rkbufq->rkbq_cnt, 1);
-        (void)rd_atomic32_sub(&rkbufq->rkbq_msg_cnt,
-                              rkbuf->rkbuf_msgq.rkmq_msg_cnt);
+	rd_atomic32_sub(&rkbufq->rkbq_cnt, 1);
+        if (rkbuf->rkbuf_reqhdr.ApiKey == RD_KAFKAP_Produce)
+                rd_atomic32_sub(&rkbufq->rkbq_msg_cnt,
+                                rd_kafka_msgq_len(&rkbuf->rkbuf_batch.msgq));
 }
 
 void rd_kafka_bufq_init(rd_kafka_bufq_t *rkbufq) {
@@ -281,30 +284,32 @@ void rd_kafka_bufq_connection_reset (rd_kafka_broker_t *rkb,
 
 
 void rd_kafka_bufq_dump (rd_kafka_broker_t *rkb, const char *fac,
-			 rd_kafka_bufq_t *rkbq) {
-	rd_kafka_buf_t *rkbuf;
-	int cnt = rd_kafka_bufq_cnt(rkbq);
-	rd_ts_t now;
+                         rd_kafka_bufq_t *rkbq) {
+        rd_kafka_buf_t *rkbuf;
+        int cnt = rd_kafka_bufq_cnt(rkbq);
+        rd_ts_t now;
 
-	if (!cnt)
-		return;
+        if (!cnt)
+                return;
 
-	now = rd_clock();
+        now = rd_clock();
 
-	rd_rkb_dbg(rkb, BROKER, fac, "bufq with %d buffer(s):", cnt);
+        rd_rkb_dbg(rkb, BROKER, fac, "bufq with %d buffer(s):", cnt);
 
-	TAILQ_FOREACH(rkbuf, &rkbq->rkbq_bufs, rkbuf_link) {
-		rd_rkb_dbg(rkb, BROKER, fac,
-			   " Buffer %s (%"PRIusz" bytes, corrid %"PRId32", "
-			   "connid %d, retry %d in %lldms, timeout in %lldms",
-			   rd_kafka_ApiKey2str(rkbuf->rkbuf_reqhdr.ApiKey),
-			   rkbuf->rkbuf_totlen, rkbuf->rkbuf_corrid,
-			   rkbuf->rkbuf_connid, rkbuf->rkbuf_retries,
-			   rkbuf->rkbuf_ts_retry ?
-			   (now - rkbuf->rkbuf_ts_retry) / 1000LL : 0,
-			   rkbuf->rkbuf_ts_timeout ?
-			   (now - rkbuf->rkbuf_ts_timeout) / 1000LL : 0);
-	}
+        TAILQ_FOREACH(rkbuf, &rkbq->rkbq_bufs, rkbuf_link) {
+                rd_rkb_dbg(rkb, BROKER, fac,
+                           " Buffer %s (%"PRIusz" bytes, corrid %"PRId32", "
+                           "connid %d, prio %d, retry %d in %lldms, "
+                           "timeout in %lldms)",
+                           rd_kafka_ApiKey2str(rkbuf->rkbuf_reqhdr.ApiKey),
+                           rkbuf->rkbuf_totlen, rkbuf->rkbuf_corrid,
+                           rkbuf->rkbuf_connid, rkbuf->rkbuf_prio,
+                           rkbuf->rkbuf_retries,
+                           rkbuf->rkbuf_ts_retry ?
+                           (rkbuf->rkbuf_ts_retry - now) / 1000LL : 0,
+                           rkbuf->rkbuf_ts_timeout ?
+                           (rkbuf->rkbuf_ts_timeout - now) / 1000LL : 0);
+        }
 }
 
 
@@ -320,27 +325,34 @@ void rd_kafka_buf_calc_timeout (const rd_kafka_t *rk, rd_kafka_buf_t *rkbuf,
                  * Relative timeout, set request timeout to
                  * to now + rel timeout. */
                 rkbuf->rkbuf_ts_timeout = now + rkbuf->rkbuf_rel_timeout * 1000;
-        } else {
+        } else if (!rkbuf->rkbuf_force_timeout) {
                 /* Use absolute timeout, limited by socket.timeout.ms */
                 rd_ts_t sock_timeout = now +
                         rk->rk_conf.socket_timeout_ms * 1000;
 
                 rkbuf->rkbuf_ts_timeout =
                         RD_MIN(sock_timeout, rkbuf->rkbuf_abs_timeout);
+        } else {
+                /* Use absolue timeout without limit. */
+                rkbuf->rkbuf_ts_timeout = rkbuf->rkbuf_abs_timeout;
         }
 }
 
 /**
- * Retry failed request, depending on the error.
+ * Retry failed request, if permitted.
  * @remark \p rkb may be NULL
+ * @remark the retry count is only increased for actually transmitted buffers,
+ *         if there is a failure while the buffers lingers in the output queue
+ *         (rkb_outbufs) then the retry counter is not increased.
  * Returns 1 if the request was scheduled for retry, else 0.
  */
 int rd_kafka_buf_retry (rd_kafka_broker_t *rkb, rd_kafka_buf_t *rkbuf) {
+        int incr_retry = rd_kafka_buf_was_sent(rkbuf) ? 1 : 0;
 
         if (unlikely(!rkb ||
 		     rkb->rkb_source == RD_KAFKA_INTERNAL ||
 		     rd_kafka_terminating(rkb->rkb_rk) ||
-		     rkbuf->rkbuf_retries + 1 >
+		     rkbuf->rkbuf_retries + incr_retry >
 		     rkb->rkb_rk->rk_conf.max_retries))
                 return 0;
 
@@ -352,7 +364,7 @@ int rd_kafka_buf_retry (rd_kafka_broker_t *rkb, rd_kafka_buf_t *rkbuf) {
 	/* Try again */
 	rkbuf->rkbuf_ts_sent = 0;
         rkbuf->rkbuf_ts_timeout = 0; /* Will be updated in calc_timeout() */
-	rkbuf->rkbuf_retries++;
+	rkbuf->rkbuf_retries += incr_retry;
 	rd_kafka_buf_keep(rkbuf);
 	rd_kafka_broker_buf_retry(rkb, rkbuf);
 	return 1;
